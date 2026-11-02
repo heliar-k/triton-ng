@@ -49,6 +49,43 @@ impl Backend for MyBackend {
 }
 ```
 
+### Streaming responses
+
+A model with `model_transaction_policy { decoupled: true }` can send several
+responses through a `ResponseFactory`:
+
+```rust
+let mut factory = ResponseFactory::new(request)?;
+for tokens in chunks {
+    let mut response = factory.response()?;
+    response
+        .create_output("TOKENS", DataType::Int64, &[1, tokens.len() as i64])?
+        .write_i64_vec(&tokens)?;
+    response.send()?;
+}
+factory.finish()?;
+```
+
+Call `factory.release_request()` after the last input read to let Triton
+release the request and its input tensors early. The factory can still create
+responses and query `factory.is_cancelled()` afterwards.
+
+For BLS calls to a decoupled model, `Server::infer_stream` yields each result;
+`Server::infer_async` continues to aggregate all results into one:
+
+```rust
+let mut stream = ctx.server().infer_stream(inference);
+while let Some(result) = stream.next().await {
+    let result = result?;
+    for output in &result.outputs {
+        consume(output)?;
+    }
+}
+```
+
+Dropping an `InferenceStream` before it ends cancels its BLS request on a
+best-effort basis. Dropping an `InferenceFuture` does not cancel it.
+
 Build as a `cdylib`:
 
 ```toml

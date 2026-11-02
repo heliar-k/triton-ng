@@ -13,6 +13,14 @@ pub(crate) type InputBuffers = Vec<Box<dyn Send>>;
 /// once the buffer is handed to Triton.
 pub(crate) type OutputBuffers = HashMap<String, Option<OutputBuffer>>;
 
+fn validate_streaming_outputs(outputs: &OutputBuffers) -> Result<(), String> {
+    if outputs.values().any(Option::is_some) {
+        Err("preallocated output buffers are not supported by infer_stream".to_string())
+    } else {
+        Ok(())
+    }
+}
+
 /// A BLS request to another model, submitted with [`crate::Server::infer_async`].
 ///
 /// Owns the `TRITONSERVER_InferenceRequest` and its input buffers. Dropped
@@ -55,6 +63,10 @@ impl InferenceRequest {
             buffers: Vec::new(),
             outputs: HashMap::new(),
         })
+    }
+
+    pub(crate) fn ensure_streaming_compatible(&self) -> Result<(), TritonError> {
+        validate_streaming_outputs(&self.outputs).map_err(TritonError::from_message)
     }
 
     /// Splits the request into the raw pointer, the input buffers it
@@ -224,5 +236,24 @@ impl Drop for InferenceRequest {
                 triton_ng_sys::TRITONSERVER_InferenceRequestDelete(self.ptr);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OutputBuffers, validate_streaming_outputs};
+    use crate::MemoryManager;
+
+    #[test]
+    fn streaming_rejects_preallocated_output_buffers() {
+        let mut outputs = OutputBuffers::new();
+        assert!(validate_streaming_outputs(&outputs).is_ok());
+        outputs.insert("used".to_string(), None);
+        assert!(validate_streaming_outputs(&outputs).is_ok());
+        outputs.insert(
+            "preallocated".to_string(),
+            Some(MemoryManager::heap().ram(8).unwrap().into()),
+        );
+        assert!(validate_streaming_outputs(&outputs).is_err());
     }
 }

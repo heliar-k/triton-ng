@@ -2,6 +2,7 @@
   "triton_url": "http://localhost:8001",
   "mnist_model": "mnist_onnx",
   "backend_model": "mnist",
+  "stream_proxy_model": "stream_proxy",
   "input_name": "Input3",
   "output_name": "Plus214_Output_0",
   "backend_output_name": "DIGIT"

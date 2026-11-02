@@ -1,23 +1,121 @@
-use crate::inference_future::Completion;
+use crate::inference_future::{CancelInference, InferenceStream, StreamItem, StreamSender};
 use crate::inference_request::InputBuffers;
 use crate::inference_response::InferenceResponse;
 use crate::message::Message;
 use crate::response_allocator::{OutputPlan, ResponseAllocator};
 use crate::utils::cstring_from_str;
-use crate::{InferenceFuture, InferenceRequest, InferenceResult, OutputTensor, TritonError};
+use crate::{InferenceFuture, InferenceRequest, InferenceResult, TritonError};
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use triton_ng_macros::triton_call;
+
+#[derive(Default)]
+struct RequestState {
+    final_seen: bool,
+    released: bool,
+    deleted: bool,
+}
+
+impl RequestState {
+    fn complete(&mut self) -> bool {
+        self.final_seen = true;
+        self.mark_deleted_when_ready()
+    }
+
+    fn release(&mut self) -> bool {
+        self.released = true;
+        self.mark_deleted_when_ready()
+    }
+
+    fn can_cancel(&self) -> bool {
+        !self.final_seen && !self.deleted
+    }
+
+    fn mark_deleted_when_ready(&mut self) -> bool {
+        if self.final_seen && self.released && !self.deleted {
+            self.deleted = true;
+            return true;
+        }
+        false
+    }
+}
+
+/// Synchronizes cancellation with the response and release callbacks.
+pub(crate) struct RequestControl {
+    ptr: *mut triton_ng_sys::TRITONSERVER_InferenceRequest,
+    state: Mutex<RequestState>,
+}
+
+// SAFETY: the raw request is accessed only while holding `state`. It is
+// deleted once FINAL and RELEASE_ALL have both arrived, and cancellation is
+// excluded after deletion.
+unsafe impl Send for RequestControl {}
+unsafe impl Sync for RequestControl {}
+
+impl RequestControl {
+    fn new(ptr: *mut triton_ng_sys::TRITONSERVER_InferenceRequest) -> Self {
+        Self {
+            ptr,
+            state: Mutex::new(RequestState::default()),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, RequestState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn complete(&self) {
+        if self.lock().complete() {
+            self.delete();
+        }
+    }
+
+    fn release(&self) {
+        if self.lock().release() {
+            self.delete();
+        }
+    }
+
+    fn delete(&self) {
+        let error = unsafe { triton_ng_sys::TRITONSERVER_InferenceRequestDelete(self.ptr) };
+        if !error.is_null() {
+            let error = unsafe { TritonError::new(error) };
+            crate::log::error(&format!("failed to delete inference request: {error}"));
+        }
+    }
+}
+
+impl CancelInference for RequestControl {
+    fn cancel(&self) {
+        let state = self.lock();
+        if !state.can_cancel() {
+            return;
+        }
+        // Cancel only sets the request's cancellation state in Triton. Holding
+        // the lock prevents FINAL and release from deleting the request during
+        // this call.
+        let error = unsafe { triton_ng_sys::TRITONSERVER_InferenceRequestCancel(self.ptr) };
+        if !error.is_null() {
+            let error = unsafe { TritonError::new(error) };
+            crate::log::error(&format!("failed to cancel inference request: {error}"));
+        }
+        drop(state);
+    }
+}
+
+struct ReleaseContext {
+    _buffers: InputBuffers,
+    control: Arc<RequestControl>,
+}
 
 /// What the response callback of one BLS request needs, handed to Triton as
 /// `response_userp` and freed with the final response.
 pub(crate) struct InferenceContext {
-    completion: Arc<Completion>,
+    sender: StreamSender,
     allocator: ResponseAllocator,
     outputs: OutputPlan,
-    pending_outputs: Vec<OutputTensor>,
-    error: Option<String>,
+    control: Arc<RequestControl>,
 }
 
 /// The Triton server the backend runs in, used for BLS: inference of other
@@ -33,9 +131,7 @@ pub(crate) struct InferenceContext {
 /// async fn model_instance_execute(ctx: Context, requests: Vec<Request>) -> Result<(), Error> {
 ///     let state = ctx.state::<State>()?;
 ///     let mut inference = InferenceRequest::new(ctx.server(), &state.encoder, -1)?;
-///     // ... add the inputs of all `requests` as one batch ...
 ///     let result = ctx.server().infer_async(inference).await?;
-///     // ... answer every request from its rows of `result` ...
 ///     Ok(())
 /// }
 /// ```
@@ -46,10 +142,10 @@ pub struct Server {
 
 // SAFETY: the pointer is the TRITONSERVER_Server, which the frontends call
 // from many threads at once. TRITONSERVER_ServerDelete waits for in-flight
-// requests and for every model to unload before freeing it (InferenceServer::Stop),
-// and a model is not unloaded while any of its requests is alive, so the
-// pointer outlives every `Request` the backend holds. Only an expired
-// --exit-timeout-secs on shutdown breaks this, when the process is exiting.
+// requests and for every model to unload before freeing it, and a model is
+// not unloaded while any of its requests is alive, so the pointer outlives
+// every `Request` the backend holds. Only an expired exit timeout on shutdown
+// breaks this, when the process is exiting.
 unsafe impl Send for Server {}
 unsafe impl Sync for Server {}
 
@@ -118,191 +214,237 @@ impl Server {
         metadata.to_json()
     }
 
-    /// Submits inference and returns a future of its result, see
-    /// [`InferenceFuture`]. Submission errors are reported by the future.
+    /// Submits inference and returns a future that aggregates every response
+    /// into one final result. Submission errors are reported by the future.
+    /// Dropping the future does not cancel the request.
     ///
     /// # Examples
     ///
     /// ```ignore
-    /// let mut inference = InferenceRequest::new(&server, "encoder", -1)?;
-    /// inference.add_input_with_data("AUDIO", DataType::Fp32, &[1, samples.len() as i64], bytes)?;
-    /// inference.add_requested_output("EMBEDDING")?;
-    ///
     /// let result = server.infer_async(inference).await?;
     /// let embedding = result.output("EMBEDDING")?.as_fp32_vec()?;
     /// ```
-    ///
-    /// Takes ownership of `request`. The request is freed by the
-    /// `inference_request_release` callback, which Triton calls only *after* the
-    /// backend has fully released all references to it. This prevents the race
-    /// where `InferenceRequest::Drop` frees the object while Triton's backend
-    /// thread still holds a pointer (which causes a SIGSEGV in
-    /// `TRITONBACKEND_RequestRelease`).
-    ///
-    /// The input buffers owned by the request are freed by the same callback:
-    /// Triton may read them until the request is released, which can happen
-    /// after the final response has already been delivered.
     pub fn infer_async(&self, request: InferenceRequest) -> InferenceFuture {
-        let completion = Completion::new();
-        match self.submit(request, Arc::clone(&completion)) {
-            Ok(()) => InferenceFuture::new(completion),
-            Err(e) => InferenceFuture::new(Completion::failed(e.to_string())),
-        }
+        InferenceFuture::new(self.submit(request, false))
     }
 
-    fn submit(
-        &self,
-        request: InferenceRequest,
-        completion: Arc<Completion>,
-    ) -> Result<(), TritonError> {
-        let allocator = ResponseAllocator::new()?;
+    /// Submits inference and returns each response through an
+    /// [`InferenceStream`]. Requests with preallocated output buffers are
+    /// rejected before submission because one buffer cannot receive multiple
+    /// responses. Dropping the stream before FINAL cancels the request on a
+    /// best-effort basis.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let mut stream = server.infer_stream(inference);
+    /// while let Some(result) = stream.next().await {
+    ///     let result = result?;
+    ///     println!("{} output(s), FINAL={}", result.outputs.len(), result.is_final);
+    /// }
+    /// ```
+    pub fn infer_stream(&self, request: InferenceRequest) -> InferenceStream {
+        if let Err(error) = request.ensure_streaming_compatible() {
+            return InferenceStream::failed(error.to_string());
+        }
+        self.submit(request, true)
+    }
 
+    fn submit(&self, request: InferenceRequest, cancel_on_drop: bool) -> InferenceStream {
+        let allocator = match ResponseAllocator::new() {
+            Ok(allocator) => allocator,
+            Err(error) => return InferenceStream::failed(error.to_string()),
+        };
         let (raw, buffers, outputs) = request.into_raw_parts();
-        let buffers_ptr = Box::into_raw(Box::new(buffers)) as *mut c_void;
+        let control = Arc::new(RequestControl::new(raw));
+        let cancellation: Arc<dyn CancelInference> = control.clone();
+        let (sender, stream) = InferenceStream::channel(Some(cancellation), cancel_on_drop);
 
-        // Register the release callback before handing the request to Triton.
-        if let Err(e) = triton_call!(
+        if let Err(error) =
+            self.submit_raw(raw, buffers, outputs, allocator, &control, sender.clone())
+        {
+            let _ = sender.send(Err(error.to_string()));
+        }
+        stream
+    }
+
+    fn submit_raw(
+        &self,
+        raw: *mut triton_ng_sys::TRITONSERVER_InferenceRequest,
+        buffers: InputBuffers,
+        outputs: crate::inference_request::OutputBuffers,
+        allocator: ResponseAllocator,
+        control: &Arc<RequestControl>,
+        sender: StreamSender,
+    ) -> Result<(), TritonError> {
+        let release_context = Box::new(ReleaseContext {
+            _buffers: buffers,
+            control: Arc::clone(control),
+        });
+        let release_ptr = Box::into_raw(release_context);
+
+        if let Err(error) = triton_call!(
             triton_ng_sys::TRITONSERVER_InferenceRequestSetReleaseCallback(
                 raw,
                 Some(inference_request_release),
-                buffers_ptr,
+                release_ptr.cast(),
             )
         ) {
-            // Triton never saw this request, release everything ourselves.
-            unsafe { inference_request_release(raw, RELEASE_ALL, buffers_ptr) };
-            return Err(e);
+            unsafe { cleanup_unsubmitted(raw, release_ptr) };
+            return Err(error);
         }
 
         let context = Box::new(InferenceContext {
-            completion,
+            sender,
             allocator,
             outputs: OutputPlan::new(outputs),
-            pending_outputs: Vec::new(),
-            error: None,
+            control: Arc::clone(control),
         });
-        let context_ptr = Box::into_raw(context) as *mut c_void;
+        let context_ptr = Box::into_raw(context);
+        let context_ref = unsafe { &*context_ptr };
 
-        if let Err(e) = triton_call!(
+        if let Err(error) = triton_call!(
             triton_ng_sys::TRITONSERVER_InferenceRequestSetResponseCallback(
                 raw,
-                (*context_ptr.cast::<InferenceContext>()).allocator.as_ptr(),
-                ptr::from_ref(&(*context_ptr.cast::<InferenceContext>()).outputs)
-                    .cast_mut()
-                    .cast(),
+                context_ref.allocator.as_ptr(),
+                ptr::from_ref(&context_ref.outputs).cast_mut().cast(),
                 Some(inference_response_complete),
-                context_ptr,
+                context_ptr.cast(),
             )
         ) {
             unsafe {
-                drop(Box::from_raw(context_ptr as *mut InferenceContext));
-                inference_request_release(raw, RELEASE_ALL, buffers_ptr);
+                drop(Box::from_raw(context_ptr));
+                cleanup_unsubmitted(raw, release_ptr);
             }
-            return Err(e);
+            return Err(error);
         }
 
-        // Transfer ownership to Triton. The release callback now owns deletion.
-        if let Err(e) = triton_call!(triton_ng_sys::TRITONSERVER_ServerInferAsync(
+        if let Err(error) = triton_call!(triton_ng_sys::TRITONSERVER_ServerInferAsync(
             self.ptr,
             raw,
             ptr::null_mut(),
         )) {
-            // Triton guarantees it will NOT call neither the release nor the
-            // response callback on failure, so we must clean up manually.
+            // Submission failure guarantees neither callback ran.
             unsafe {
-                drop(Box::from_raw(context_ptr as *mut InferenceContext));
-                inference_request_release(raw, RELEASE_ALL, buffers_ptr);
+                drop(Box::from_raw(context_ptr));
+                cleanup_unsubmitted(raw, release_ptr);
             }
-            return Err(e);
+            return Err(error);
         }
 
         Ok(())
     }
 }
 
-/// Called by Triton after the backend has fully released the inference request.
-/// At this point it is safe to delete the request object.
-///
-/// `userp` is the boxed [`InputBuffers`] referenced by the request, they are
-/// freed only after the request itself is deleted.
-///
-/// The header says RELEASE_ALL should always be set today, but recommends
-/// checking explicitly in case future versions add new flags.
-unsafe extern "C" fn inference_request_release(
+/// Cleans up a request that Triton never started. FINAL is marked so the
+/// release path can delete the request immediately.
+unsafe fn cleanup_unsubmitted(
     request: *mut triton_ng_sys::TRITONSERVER_InferenceRequest,
-    flags: u32,
-    userp: *mut std::os::raw::c_void,
+    release_ptr: *mut ReleaseContext,
 ) {
-    if flags & RELEASE_ALL == 0 {
+    let control = unsafe { &(*release_ptr).control };
+    control.complete();
+    unsafe { inference_request_release(request, RELEASE_ALL, release_ptr.cast()) };
+}
+
+/// Called by Triton after the backend has fully released the inference request.
+/// Input buffers are freed here. The small request object is deleted once the
+/// FINAL response has also arrived, so a dropped stream can still cancel after
+/// an early downstream request release.
+unsafe extern "C" fn inference_request_release(
+    _request: *mut triton_ng_sys::TRITONSERVER_InferenceRequest,
+    flags: u32,
+    userp: *mut c_void,
+) {
+    if flags & RELEASE_ALL == 0 || userp.is_null() {
         return;
     }
-
-    if !request.is_null() {
-        unsafe { triton_ng_sys::TRITONSERVER_InferenceRequestDelete(request) };
-    }
-
-    if !userp.is_null() {
-        unsafe { drop(Box::from_raw(userp as *mut InputBuffers)) };
-    }
+    let context = unsafe { Box::from_raw(userp as *mut ReleaseContext) };
+    context.control.release();
+    drop(context);
 }
 
 const RELEASE_ALL: u32 =
     triton_ng_sys::tritonserver_requestreleaseflag_enum_TRITONSERVER_REQUEST_RELEASE_ALL;
 
-/// Called by Triton for each response (and once more with a null response when
-/// RESPONSE_COMPLETE_FINAL is set, to signal end-of-stream).
-///
-/// For one-to-one models this is called exactly once with FINAL set.
-/// For decoupled/streaming models it may be called multiple times; we
-/// accumulate outputs across all non-final callbacks and only send the
-/// collected result (and drop the context) when FINAL arrives.
+fn read_response(
+    response_ptr: *mut triton_ng_sys::TRITONSERVER_InferenceResponse,
+    is_final: bool,
+) -> StreamItem {
+    let response = InferenceResponse::from_ptr(response_ptr).map_err(|error| error.to_string())?;
+    if let Some(error) = response.error() {
+        return Err(error.to_string());
+    }
+    let outputs = response.outputs().map_err(|error| error.to_string())?;
+    Ok(InferenceResult {
+        outputs,
+        error: None,
+        is_final,
+    })
+}
+
+/// Called by Triton for each response, and for an empty FINAL that only marks
+/// end-of-stream. The callback context is reclaimed only with FINAL.
 unsafe extern "C" fn inference_response_complete(
     response_ptr: *mut triton_ng_sys::TRITONSERVER_InferenceResponse,
     flags: u32,
-    userp: *mut std::os::raw::c_void,
+    userp: *mut c_void,
 ) {
-    use triton_ng_sys::tritonserver_responsecompleteflag_enum_TRITONSERVER_RESPONSE_COMPLETE_FINAL as FINAL;
+    const FINAL: u32 =
+        triton_ng_sys::tritonserver_responsecompleteflag_enum_TRITONSERVER_RESPONSE_COMPLETE_FINAL;
     let is_final = flags & FINAL != 0;
 
     if userp.is_null() {
-        // No context to report to: still free the response.
         if !response_ptr.is_null() {
             drop(InferenceResponse::from_ptr(response_ptr));
         }
         return;
     }
 
-    // Borrow context without taking ownership — we only own it on the final call.
     let context = unsafe { &mut *(userp as *mut InferenceContext) };
-
     if !response_ptr.is_null() {
-        match InferenceResponse::from_ptr(response_ptr) {
-            Err(e) => {
-                context.error.get_or_insert_with(|| e.to_string());
-            }
-            Ok(response) => {
-                if let Some(err) = response.error() {
-                    context.error.get_or_insert_with(|| err.to_string());
-                } else {
-                    match response.outputs() {
-                        Ok(outputs) => context.pending_outputs.extend(outputs),
-                        Err(e) => {
-                            context.error.get_or_insert_with(|| e.to_string());
-                        }
-                    }
-                }
-            }
-        }
+        let result = read_response(response_ptr, is_final);
+        // A closed receiver discards the result. `read_response` has already
+        // deleted the C response and retained only owned Rust output data.
+        let _ = context.sender.send(result);
     }
 
     if is_final {
-        let context = unsafe { Box::from_raw(userp as *mut InferenceContext) };
-        let result = match context.error {
-            Some(error) => InferenceResult::failed(error),
-            None => InferenceResult {
-                outputs: context.pending_outputs,
-                error: None,
-            },
-        };
-        context.completion.complete(result);
+        context.control.complete();
+        unsafe { drop(Box::from_raw(userp as *mut InferenceContext)) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RequestState;
+
+    #[test]
+    fn request_is_deleted_after_release_then_final() {
+        let mut state = RequestState::default();
+        assert!(!state.release());
+        assert!(state.can_cancel());
+        assert!(state.complete());
+        assert!(!state.can_cancel());
+        assert!(!state.complete());
+        assert!(!state.release());
+    }
+
+    #[test]
+    fn request_is_deleted_after_final_then_release() {
+        let mut state = RequestState::default();
+        assert!(!state.complete());
+        assert!(!state.can_cancel());
+        assert!(state.release());
+        assert!(!state.release());
+    }
+
+    #[test]
+    fn unfinished_request_is_not_deleted_or_cancelled_after_final() {
+        let mut state = RequestState::default();
+        assert!(state.can_cancel());
+        assert!(!state.complete());
+        assert!(!state.can_cancel());
+        assert!(!state.complete());
     }
 }

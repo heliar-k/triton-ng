@@ -7,6 +7,7 @@ pub struct Config {
     pub triton_url: String,
     pub mnist_model: String,
     pub backend_model: String,
+    pub stream_proxy_model: String,
     pub input_name: String,
     pub output_name: String,
     pub backend_output_name: String,

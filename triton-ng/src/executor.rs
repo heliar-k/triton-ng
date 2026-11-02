@@ -1,6 +1,7 @@
 use crate::error::Error;
 use crate::memory_manager::MemoryManager;
 use crate::model::{Model, SharedState};
+use crate::model_instance::InstanceHandle;
 use crate::server::Server;
 use std::any::Any;
 use std::future::Future;
@@ -19,8 +20,9 @@ const MAX_BATCHES_IN_FLIGHT: &str = "max_batches_in_flight";
 /// memory manager, the state stored with [`Model::set_state`] and the state
 /// of its instance stored with [`crate::ModelInstance::set_state`].
 ///
-/// `Context` is `Send + Clone` and holds no Triton pointers, so it can be used
-/// across `.await` and passed to other tasks.
+/// `Context` is `Send + Sync + Clone`. Its instance handle stays valid until
+/// the instance runtime has drained every batch, so it can be held across
+/// `.await` and passed to other tasks.
 ///
 /// # Examples
 ///
@@ -40,6 +42,7 @@ pub struct Context {
     memory: MemoryManager,
     state: Option<SharedState>,
     instance_state: Option<SharedState>,
+    instance: InstanceHandle,
     device_id: i32,
 }
 
@@ -89,6 +92,10 @@ impl Context {
             .ok_or("model instance state is not initialized")?
             .downcast_ref::<T>()
             .ok_or_else(|| "model instance state has unexpected type".into())
+    }
+
+    pub(crate) fn instance(&self) -> &InstanceHandle {
+        &self.instance
     }
 
     /// Device of the instance that runs the batch (GPU id for `KIND_GPU`).
@@ -183,6 +190,7 @@ impl InstanceExecutor {
 pub(crate) fn context(
     model: &Model,
     executor: &InstanceExecutor,
+    instance: InstanceHandle,
     device_id: i32,
 ) -> Result<Context, Error> {
     Ok(Context {
@@ -190,6 +198,7 @@ pub(crate) fn context(
         memory: MemoryManager::of_model(model)?,
         state: model.shared_state()?,
         instance_state: executor.state.get().cloned(),
+        instance,
         device_id,
     })
 }

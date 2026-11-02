@@ -18,6 +18,7 @@ pub struct Output<'a> {
     elements: usize,
     written: bool,
     pending_outputs: &'a mut usize,
+    compute_output_start: &'a mut Option<u64>,
 }
 
 impl<'a> Output<'a> {
@@ -27,6 +28,7 @@ impl<'a> Output<'a> {
         datatype: DataType,
         elements: usize,
         pending_outputs: &'a mut usize,
+        compute_output_start: &'a mut Option<u64>,
     ) -> Self {
         Self {
             ptr,
@@ -35,6 +37,7 @@ impl<'a> Output<'a> {
             elements,
             written: false,
             pending_outputs,
+            compute_output_start,
         }
     }
 
@@ -100,6 +103,9 @@ impl<'a> Output<'a> {
 
         self.written = true;
         *self.pending_outputs = self.pending_outputs.saturating_sub(1);
+        if *self.pending_outputs == 0 {
+            *self.compute_output_start = Some(crate::timing::monotonic_nanos());
+        }
 
         Ok(())
     }

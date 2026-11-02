@@ -97,7 +97,7 @@ factory.finish()?;                                   // 发 FINAL 并释放请�
 - `Drop for ResponseFactory`：请求还没释放时，没有最终响应就补一条错误响应，再发 FINAL；请求已经释放时只删工厂，不补任何响应。
 - `Drop for Response` 走同一条状态机：未发送的响应补一条错误响应。`Response<'static>` 自己持有请求，所以它同时负责释放请求；`Response<'f>` 的请求由工厂负责。
 
-头文件没有规定删掉工厂之后未结束请求会怎样，所以兜底路径一律先把 FINAL 发出去，再删工厂。
+C 实现的 `TRITONBACKEND_ResponseFactoryDelete` 只释放工厂自身的 `shared_ptr`，不发送响应或 flags。Drop 在请求未释放时补错误响应和 FINAL；请求已释放时只删除工厂，与 C 的工厂生命周期一致。
 
 `Response<'f>` 与工厂必须处在同一个任务里：借用关系保证工厂活得比响应久，但把响应移进要求 `'static` 的 `tokio::spawn` 需要连同工厂的所有权一起移进去。工厂自身是 `Send`，不含借用。
 

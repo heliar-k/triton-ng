@@ -72,7 +72,7 @@ actual="$(nm -D --defined-only "${SO}" | awk '{print $3}' | grep '^TRITONBACKEND
 
 echo "== 组装模型仓库 =="
 [[ -f models/mnist_onnx/1/model.onnx ]] || make download-model
-for model in mnist mnist_onnx identity_gpu; do
+for model in mnist mnist_onnx identity_gpu decoupled stream_proxy; do
   mkdir -p "${MODELS}/${model}/1"
   cp "verify/models/${model}/config.pbtxt" "${MODELS}/${model}/config.pbtxt"
 done
@@ -116,7 +116,9 @@ docker run -d --name "${CONTAINER}" \
   ${shm_flag[@]+"${shm_flag[@]}"} \
   --load-model=mnist \
   --load-model=mnist_onnx \
-  --load-model=identity_gpu >/dev/null
+  --load-model=identity_gpu \
+  --load-model=decoupled \
+  --load-model=stream_proxy >/dev/null
 
 echo "== 等待服务器就绪 =="
 for _ in $(seq 1 60); do

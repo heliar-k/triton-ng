@@ -46,6 +46,8 @@ pub mod response;
 pub(crate) mod response_allocator;
 #[path = "server.rs"]
 pub mod server;
+#[path = "timing.rs"]
+pub(crate) mod timing;
 #[path = "types.rs"]
 pub mod types;
 #[path = "utils.rs"]
@@ -188,7 +190,7 @@ pub mod __macro_support {
         requests_ptr: *const *mut c_void,
         request_count: u32,
     ) -> ErrorPtr {
-        let (model, requests) =
+        let (model, mut requests) =
             match unsafe { model_and_requests(instance, requests_ptr, request_count) } {
                 Ok(parts) => parts,
                 Err(err) => return err,
@@ -197,15 +199,27 @@ pub mod __macro_support {
 
         let prepared = catch(|| {
             let executor = instance.executor()?;
-            let ctx = crate::executor::context(&model, executor, instance.device_id()?)?;
+            let ctx = crate::executor::context(
+                &model,
+                executor,
+                instance.handle(),
+                instance.device_id()?,
+            )?;
+            for request in &mut requests {
+                request.set_instance(ctx.instance().clone());
+            }
             Ok((executor, ctx))
         });
 
         match prepared {
             Ok((executor, ctx)) => {
-                let batch = B::model_instance_execute(ctx, requests);
                 let result = catch(|| {
                     executor.spawn(async move {
+                        let mut requests = requests;
+                        for request in &mut requests {
+                            request.start_compute();
+                        }
+                        let batch = B::model_instance_execute(ctx, requests);
                         if let Err(e) = batch.await {
                             crate::log::error(&format!("model instance execute failed: {e}"));
                         }
@@ -349,9 +363,7 @@ pub mod __macro_support {
     #[cfg(test)]
     mod tests {
         use super::validate_api_version;
-        use triton_ng_sys::{
-            TRITONBACKEND_API_VERSION_MAJOR, TRITONBACKEND_API_VERSION_MINOR,
-        };
+        use triton_ng_sys::{TRITONBACKEND_API_VERSION_MAJOR, TRITONBACKEND_API_VERSION_MINOR};
 
         #[test]
         fn api_version_accepts_same_major_and_compatible_minor() {
@@ -388,8 +400,8 @@ pub mod __macro_support {
         #[test]
         fn api_version_rejects_older_server_minor() {
             let server_minor = TRITONBACKEND_API_VERSION_MINOR - 1;
-            let error = validate_api_version(TRITONBACKEND_API_VERSION_MAJOR, server_minor)
-                .unwrap_err();
+            let error =
+                validate_api_version(TRITONBACKEND_API_VERSION_MAJOR, server_minor).unwrap_err();
             let message = error.to_string();
             assert!(message.contains(&format!(
                 "server {TRITONBACKEND_API_VERSION_MAJOR}.{server_minor}"
@@ -406,6 +418,7 @@ mod tests {
     use crate::allocation::Allocation;
     use crate::inference_response::InferenceResponse;
     use crate::message::Message;
+    use crate::model_instance::InstanceHandle;
     use crate::response_allocator::ResponseAllocator;
     use crate::*;
 
@@ -441,22 +454,31 @@ mod tests {
             Server,
             Context,
             MemoryManager,
+            InstanceHandle,
             RamBuffer,
             PinnedRamBuffer,
             GpuBuffer,
             UninitGpuBuffer,
             OutputBuffer,
             InferenceFuture,
+            InferenceStream,
             InferenceResult,
             Message,
             ResponseAllocator,
             Allocation
         );
-        send_not_sync!(Request, Response, InferenceRequest, InferenceResponse);
+        send_not_sync!(
+            Request,
+            ResponseFactory,
+            Response<'static>,
+            InferenceRequest,
+            InferenceResponse
+        );
         neither!(
             Model,
             ModelInstance,
             BackendHandle,
+            RequestView<'static>,
             Input<'static>,
             Output<'static>,
             RawBuffer

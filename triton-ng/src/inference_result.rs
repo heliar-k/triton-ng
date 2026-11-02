@@ -76,6 +76,9 @@ impl OutputTensor {
 pub struct InferenceResult {
     pub outputs: Vec<OutputTensor>,
     pub error: Option<String>,
+    /// Whether this response carried Triton's FINAL flag. An aggregate
+    /// result returned by `infer_async` is always final.
+    pub is_final: bool,
 }
 
 impl InferenceResult {
@@ -148,15 +151,6 @@ impl InferenceResult {
     }
 }
 
-impl InferenceResult {
-    pub(crate) fn failed(message: impl Into<String>) -> Self {
-        Self {
-            outputs: vec![],
-            error: Some(message.into()),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{InferenceResult, OutputData, OutputTensor};
@@ -178,6 +172,7 @@ mod tests {
                 output("host", OutputData::Host(vec![0; 8])),
             ],
             error: None,
+            is_final: true,
         }
     }
 

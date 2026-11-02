@@ -32,9 +32,31 @@ pub struct ModelInstance {
     ptr: *mut triton_ng_sys::TRITONBACKEND_ModelInstance,
 }
 
+/// Instance pointer shared with batch tasks for request statistics and trace.
+#[derive(Clone)]
+pub(crate) struct InstanceHandle {
+    ptr: *mut triton_ng_sys::TRITONBACKEND_ModelInstance,
+}
+
+// SAFETY: model_instance_finalize drains and stops the instance runtime before
+// Triton frees the instance. Batch tasks keep this handle valid by running on
+// that runtime, and read-only C calls are synchronized by their owners.
+unsafe impl Send for InstanceHandle {}
+unsafe impl Sync for InstanceHandle {}
+
+impl InstanceHandle {
+    pub(crate) fn as_ptr(&self) -> *mut triton_ng_sys::TRITONBACKEND_ModelInstance {
+        self.ptr
+    }
+}
+
 impl ModelInstance {
     pub(crate) fn from_ptr(ptr: *mut triton_ng_sys::TRITONBACKEND_ModelInstance) -> Self {
         Self { ptr }
+    }
+
+    pub(crate) fn handle(&self) -> InstanceHandle {
+        InstanceHandle { ptr: self.ptr }
     }
 
     pub fn name(&self) -> Result<String, TritonError> {

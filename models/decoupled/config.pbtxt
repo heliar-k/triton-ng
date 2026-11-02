@@ -1,0 +1,32 @@
+name: "decoupled"
+backend: "custom_backend"
+max_batch_size: 0
+model_transaction_policy { decoupled: true }
+
+input [
+  {
+    name: "CONFIG"
+    data_type: TYPE_FP32
+    dims: [ 6 ]
+  }
+]
+
+output [
+  {
+    name: "OUTPUT"
+    data_type: TYPE_FP32
+    dims: [ -1 ]
+  }
+]
+
+instance_group [
+  {
+    count: 1
+    kind: KIND_CPU
+  }
+]
+
+parameters: {
+  key: "mode"
+  value: { string_value: "decoupled" }
+}

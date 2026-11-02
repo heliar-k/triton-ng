@@ -29,18 +29,50 @@ buffers of the instance's device. Batches of the instance get it through
 `model_instance_finalize`, once every batch of the instance has finished.
 
 **Requests are owned by the backend.** `model_instance_execute` gets `Vec<Request>`. A request can
-be answered from any thread of the runtime.
+be answered from any thread of the runtime. `Request::view` returns a read-only `RequestView<'_>`
+that never releases the request and cannot outlive it. Inputs borrow from the same request
+lifetime. After an early `ResponseFactory::release_request`, request views and inputs are no
+longer valid.
 
-**Exactly one final response.** `Response::new`, `Request::respond_error` and
-`Request::respond_cancelled` consume the request, so it cannot be answered twice. A request dropped
-without a response, including when the future returns an error or panics, gets a generic error
-response. Every request is released to Triton when it is dropped. The error returned by
+**Responses and streams.** `Response::new(request)` returns a `Response<'static>` that owns the
+request and sends one FINAL response. `Request::respond_error` and `Request::respond_cancelled`
+provide the corresponding error paths. A request dropped without response handling, including
+when the future returns an error or panics, gets a generic error response. The error returned by
 `model_instance_execute` is only logged: answer a request with `respond_error` to give the client
 the reason.
 
-**BLS is a future.** `Server::infer_async` submits the request to Triton right away and returns an
-`InferenceFuture`. Triton wakes it from its own threads. Dropping the future does not cancel the
-request: Triton finishes it and the result is discarded.
+For a decoupled model, `ResponseFactory::new(request)` takes request ownership.
+`factory.response()` returns a `Response<'f>` borrowing `&mut factory`; each such response sends
+without FINAL, and `factory.finish()` sends the empty FINAL. The mutable borrow, followed by
+`Output<'_>` borrowing its response, enforces Triton's requirement that one response's outputs and
+buffers are constructed before the next response is created. An unsent response is replaced by an
+error response on Drop. Dropping an unfinished factory whose request is still owned also sends an
+error response and FINAL. After an early request release, dropping the factory only deletes the C
+factory, matching `TRITONBACKEND_ResponseFactoryDelete`; call `finish` to end that stream.
+
+A `Response<'f>` and its factory must stay in the same task. Move the factory into the task first,
+then create the response there:
+
+```rust
+tokio::spawn(async move {
+    let mut response = factory.response()?;
+    response.create_output("VALUE", DataType::Int64, &[1])?.write_i64_vec(&[1])?;
+    response.send()?;
+    factory.finish()
+});
+```
+
+**BLS futures and streams.** `Server::infer_async` submits the request to Triton right away and
+returns an `InferenceFuture`. It collects all responses in order into one final `InferenceResult`.
+Triton wakes it from its own threads. Dropping the future does not cancel the request: Triton
+finishes it and the result is discarded.
+
+`Server::infer_stream` returns an `InferenceStream`; `next().await` yields each response separately.
+A response carrying FINAL has `InferenceResult::is_final == true`. Triton can instead send an empty
+FINAL after the last response, which only ends the stream. Dropping the stream before it ends calls
+`TRITONSERVER_InferenceRequestCancel` on a best-effort basis. Preallocated output buffers are
+rejected before a streaming submission because one buffer cannot receive multiple responses;
+they remain supported by `infer_async`.
 
 **Handles and threads.** Every type that wraps a Triton object either owns it, and then its
 `Drop` releases it, or borrows it from Triton, and then it has no `Drop` and its lifetime is
@@ -48,29 +80,34 @@ bounded by what Triton guarantees. Backend code only sees these types, never raw
 
 | Type | Triton object | On drop | `Send` | `Sync` | Notes |
 |---|---|---|---|---|---|
-| `Request` | owns the request | sends an error response if none was sent, releases the request | yes | no | one request is used by one thread at a time |
-| `Response` | owns the response | deletes it unless sent; the request gets an error response | yes | no | |
-| `Input<'_>` | borrows from its `Request` | nothing | no | no | cannot outlive the request |
+| `Request` | owns the request | sends an error response if unmanaged, releases the request | yes | no | one request is used by one thread at a time |
+| `RequestView<'_>` | borrows the request | nothing | no | no | read-only; cannot release or outlive the request |
+| `Response<'_>` | owns the response | deletes an unsent response and sends an error response | yes | no | owns the request or borrows a factory |
+| `ResponseFactory` | owns the C factory and request | finishes an owned request's stream, or deletes an early-released factory | yes | no | `response()` takes `&mut self` |
+| `Input<'_>` | borrows from its request | nothing | no | no | cannot outlive the request |
 | `Output<'_>` | borrows from its `Response` | nothing | no | no | cannot be used after the response is sent |
-| `InferenceRequest` | owns the BLS request and its input buffers | deletes it if it was never submitted | yes | no | Triton deletes it after a submit |
-| `InferenceFuture`, `InferenceResult` | none | | yes | yes | the result owns its output buffers |
+| `InferenceRequest` | owns the BLS request and its input buffers | deletes it if it was never submitted | yes | no | Triton releases it after a submit |
+| `InferenceFuture`, `InferenceStream`, `InferenceResult` | stream state and output buffers | future discards; stream cancels if unfinished | yes | yes | consumption requires `&mut self` |
 | `TritonError` | owns the error object, if any | deletes it | yes | yes | |
 | `RamBuffer`, `PinnedRamBuffer`, `GpuBuffer`, `UninitGpuBuffer` | own memory from the memory manager | free it | yes | yes | must not outlive the server, see [Memory buffers](memory_buffers.md) |
 | `Server`, `MemoryManager` | borrow the server and its memory manager | nothing | yes | yes | `Clone`; valid while any model is loaded |
-| `Context` | none | | yes | yes | `Clone` |
+| `Context` | borrows the instance through an internal handle | nothing | yes | yes | `Clone`; valid until all instance batches finish |
+| `InstanceHandle` (crate-internal) | borrows the model instance | nothing | yes | yes | `Clone`; used by request statistics and trace |
 | `Model`, `ModelInstance`, `BackendHandle` | borrow the model, instance, backend | nothing | no | no | used only in the init and finalize hooks |
 
-A unit test in the crate (`thread_safety_of_every_handle_is_as_documented`) checks every row:
+A unit test in the crate (`thread_safety_of_every_handle_is_as_documented`) checks the public rows:
 it does not compile when a type is `Send` or `Sync` where this table says it is not, or the other
-way around.
+way around. The internal instance handle has the same compile-time check.
 
 **Lifetimes.** A model is not finalized while any of its requests is alive, and the server is not
 destroyed while any model is loaded, so a batch never outlives the server it calls. Buffers from
 the memory manager must not outlive the server either: keep them in the state of the model or of
 the instance.
 
-**Cancellation.** `Request::is_cancelled` tells whether the client gave up on the request; answer it
-with `Request::respond_cancelled`. Triton reports a client that drops a gRPC call as a cancellation.
+**Cancellation.** `Request::is_cancelled` tells whether the client gave up on a non-streaming
+request; answer it with `Request::respond_cancelled`. A response factory can answer the same
+query with `ResponseFactory::is_cancelled`, including after the request was released early.
+Triton reports a client that drops a gRPC call as a cancellation.
 
 **Shutdown.** Before `Backend::model_instance_finalize`, triton-ng waits for every batch of the
 instance and stops its runtime.
@@ -80,4 +117,6 @@ instance and stops its runtime.
 `hold_until_cancelled` parameter is held until the client cancels it. The `mnist` model works on at
 most four batches at once (`max_batches_in_flight`), and unloading it waits until the held
 requests are answered. A request with the `memory` parameter is answered through memory manager
-buffers cached in the instance state, see [Memory buffers](memory_buffers.md).
+buffers cached in the instance state, see [Memory buffers](memory_buffers.md). The `decoupled`
+model produces response streams, and `stream_proxy` exercises both BLS consumption modes through
+ordinary unary client calls.

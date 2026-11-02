@@ -119,11 +119,12 @@ pub trait Backend {
     /// Process the batch as a whole and send it downstream as batched BLS
     /// calls: splitting it into tasks per request loses Triton's batching.
     ///
-    /// The backend owns `requests` and must give every one exactly one final
-    /// response, see [`Request`]. A request dropped without a response, also
-    /// when the future returns an error or panics, gets a generic error
-    /// response. The returned error is only logged: answer requests with
-    /// [`Request::respond_error`] to give clients the reason.
+    /// The backend owns `requests`. Use [`crate::Response::new`] for one final
+    /// response or [`crate::ResponseFactory`] for a response stream. A request
+    /// dropped without response handling, also when the future returns an
+    /// error or panics, gets a generic error response. The returned error is
+    /// only logged: answer requests with [`Request::respond_error`] to give
+    /// clients the reason.
     ///
     /// Corresponds to TRITONBACKEND_ModelInstanceExecute.
     fn model_instance_execute(

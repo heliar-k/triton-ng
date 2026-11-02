@@ -1,0 +1,41 @@
+name: "stream_proxy"
+backend: "custom_backend"
+max_batch_size: 0
+
+input [
+  {
+    name: "CONFIG"
+    data_type: TYPE_FP32
+    dims: [ 6 ]
+  },
+  {
+    name: "OPERATION"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+  }
+]
+
+output [
+  {
+    name: "OUTPUT"
+    data_type: TYPE_FP32
+    dims: [ -1 ]
+  }
+]
+
+instance_group [
+  {
+    count: 1
+    kind: KIND_CPU
+  }
+]
+
+parameters: {
+  key: "mode"
+  value: { string_value: "stream_proxy" }
+}
+
+parameters: {
+  key: "target_model"
+  value: { string_value: "decoupled" }
+}
