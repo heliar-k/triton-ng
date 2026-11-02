@@ -86,6 +86,7 @@ pub mod __macro_support {
     use crate::model_instance::ModelInstance;
     use crate::request::Request;
     use std::ffi::c_void;
+    use triton_ng_macros::triton_call;
 
     /// Opaque error pointer returned by Triton backend entry points.
     /// Equivalent to `*const TRITONSERVER_Error` at the ABI level.
@@ -93,10 +94,42 @@ pub mod __macro_support {
 
     const NULL_ERROR: ErrorPtr = std::ptr::null::<c_void>();
 
-    /// TRITONBACKEND_Initialize.
+    /// TRITONBACKEND_Initialize. Rejects an incompatible server API before
+    /// calling the backend hook.
     pub unsafe fn initialize<B: Backend>(backend: *mut c_void) -> ErrorPtr {
         let backend = unsafe { backend_handle(backend) };
-        into_error_ptr(catch(|| B::initialize(&backend)))
+        into_error_ptr(catch(|| {
+            check_api_version()?;
+            B::initialize(&backend)
+        }))
+    }
+
+    fn check_api_version() -> Result<(), Error> {
+        let mut server_major = 0;
+        let mut server_minor = 0;
+        triton_call!(triton_ng_sys::TRITONBACKEND_ApiVersion(
+            &mut server_major,
+            &mut server_minor
+        ))?;
+        validate_api_version(server_major, server_minor)?;
+        crate::log::info(&format!(
+            "TRITONBACKEND API version: server {server_major}.{server_minor}, compiled {}.{}",
+            triton_ng_sys::TRITONBACKEND_API_VERSION_MAJOR,
+            triton_ng_sys::TRITONBACKEND_API_VERSION_MINOR
+        ));
+        Ok(())
+    }
+
+    fn validate_api_version(server_major: u32, server_minor: u32) -> Result<(), Error> {
+        let compiled_major = triton_ng_sys::TRITONBACKEND_API_VERSION_MAJOR;
+        let compiled_minor = triton_ng_sys::TRITONBACKEND_API_VERSION_MINOR;
+        if server_major != compiled_major || server_minor < compiled_minor {
+            return Err(format!(
+                "incompatible Triton backend API version: server {server_major}.{server_minor}, compiled {compiled_major}.{compiled_minor}; expected matching major versions and server minor >= compiled minor"
+            )
+            .into());
+        }
+        Ok(())
     }
 
     /// TRITONBACKEND_Finalize.
@@ -311,6 +344,60 @@ pub mod __macro_support {
             .collect();
 
         Ok((model, requests))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::validate_api_version;
+        use triton_ng_sys::{
+            TRITONBACKEND_API_VERSION_MAJOR, TRITONBACKEND_API_VERSION_MINOR,
+        };
+
+        #[test]
+        fn api_version_accepts_same_major_and_compatible_minor() {
+            validate_api_version(
+                TRITONBACKEND_API_VERSION_MAJOR,
+                TRITONBACKEND_API_VERSION_MINOR,
+            )
+            .unwrap();
+            validate_api_version(
+                TRITONBACKEND_API_VERSION_MAJOR,
+                TRITONBACKEND_API_VERSION_MINOR + 1,
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn api_version_rejects_major_mismatch() {
+            for server_major in [
+                TRITONBACKEND_API_VERSION_MAJOR - 1,
+                TRITONBACKEND_API_VERSION_MAJOR + 1,
+            ] {
+                let error = validate_api_version(server_major, TRITONBACKEND_API_VERSION_MINOR)
+                    .unwrap_err();
+                let message = error.to_string();
+                assert!(message.contains(&format!(
+                    "server {server_major}.{TRITONBACKEND_API_VERSION_MINOR}"
+                )));
+                assert!(message.contains(&format!(
+                    "compiled {TRITONBACKEND_API_VERSION_MAJOR}.{TRITONBACKEND_API_VERSION_MINOR}"
+                )));
+            }
+        }
+
+        #[test]
+        fn api_version_rejects_older_server_minor() {
+            let server_minor = TRITONBACKEND_API_VERSION_MINOR - 1;
+            let error = validate_api_version(TRITONBACKEND_API_VERSION_MAJOR, server_minor)
+                .unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains(&format!(
+                "server {TRITONBACKEND_API_VERSION_MAJOR}.{server_minor}"
+            )));
+            assert!(message.contains(&format!(
+                "compiled {TRITONBACKEND_API_VERSION_MAJOR}.{TRITONBACKEND_API_VERSION_MINOR}"
+            )));
+        }
     }
 }
 
