@@ -60,6 +60,8 @@
 
 ## Implementation Decisions
 
+**C 实现是生命周期语义的基准。** 所有阶段涉及对象所有权、释放、回调顺序、flags 与 Drop 的设计，都必须核对 `deps/triton-core` 中 r25.09 对应的 C 实现，不能只依据头文件注释推断。Rust 侧需要额外安全兜底时，必须在对应阶段明确写出；未写明的行为与 C 实现保持一致。
+
 ### 阶段 0：API 版本校验
 
 在 `Backend::initialize` 之前调用 `TRITONBACKEND_ApiVersion`，与 bindgen 已经从 `tritonbackend.h` 生成的两个常量 `TRITONBACKEND_API_VERSION_MAJOR` / `MINOR` 比较。主版本不同，或者服务器的小版本小于编译期的小版本，就让 `initialize` 返回错误，由 Triton 拒绝加载。
