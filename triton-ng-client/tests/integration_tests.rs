@@ -481,19 +481,76 @@ async fn custom_backend_model_unloads_only_after_its_held_request_is_answered() 
 async fn custom_backend_reports_direct_final_response_statistics() -> Result<()> {
     let config = Config::load()?;
     let sut = Sut::new(&config.triton_url).await?;
-    infer_digit(&sut, &config).await?;
-
-    let stats = sut
+    let before = sut
         .model_statistics_for(&config.backend_model)
         .await?
         .into_proto();
-    let success = stats
+    let before = before
+        .response_stats
+        .get("0")
+        .and_then(|stats| stats.success)
+        .map_or(0, |stats| stats.count);
+    infer_digit(&sut, &config).await?;
+
+    let after = sut
+        .model_statistics_for(&config.backend_model)
+        .await?
+        .into_proto();
+    let after = after
         .response_stats
         .get("0")
         .context("direct response statistics not found")?
         .success
         .context("direct response success count missing")?;
-    assert!(success.count > 0);
+    assert_eq!(after.count, before + 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn host_policy_name_and_settings_are_readable() -> Result<()> {
+    let config = Config::load()?;
+    let sut = Sut::new(&config.triton_url).await?;
+    let output_name = config.backend_output_name.clone();
+    let result = sut
+        .infer(
+            &config.backend_model,
+            None,
+            vec![config.mnist_blank_input()],
+            &[&output_name],
+            None,
+        )
+        .await?;
+    let text = |name: &str| match result.parameters.get(name) {
+        Some(Parameter::String(value)) => Ok(value.as_str()),
+        other => anyhow::bail!("response parameter {name} is {other:?}"),
+    };
+    assert_eq!(text("host_policy_name")?, "stage3_policy");
+    let settings: serde_json::Value = serde_json::from_str(text("host_policy_json")?)?;
+    assert_eq!(
+        settings,
+        serde_json::json!({"stage3_policy": {"numa-node": "0"}})
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn bls_uses_host_policy_specific_input_buffer() -> Result<()> {
+    let config = Config::load()?;
+    let sut = Sut::new(&config.triton_url).await?;
+    let result = sut
+        .infer_with_parameters(
+            &config.backend_model,
+            vec![config.mnist_blank_input()],
+            &[&config.backend_output_name],
+            HashMap::from([("host_policy_input".to_string(), Parameter::Bool(true))]),
+        )
+        .await?;
+    let digit = result
+        .outputs
+        .iter()
+        .find(|output| output.name == config.backend_output_name)
+        .context("DIGIT not found")?;
+    assert_eq!(digit.data_i32.len(), 1);
     Ok(())
 }
 

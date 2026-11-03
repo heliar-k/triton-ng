@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 验证 triton-ng 在某个 Triton 镜像上的功能：构建后端、校验导出符号、起服务器、
-# 跑整套测试、运行示例客户端并做独立交叉核对。细节见 docs/verification.md。
+# 跑整套测试、运行示例客户端并做独立交叉核对，再用 24.02-py3 检查 API 版本不兼容时拒绝加载。
+# 细节见 docs/verification.md。
 #
 # 用法: scripts/verify.sh [镜像标签]     默认 26.09-py3
 set -euo pipefail
@@ -8,8 +9,10 @@ set -euo pipefail
 IMAGE_TAG="${1:-26.09-py3}"
 IMAGE="nvcr.io/nvidia/tritonserver:${IMAGE_TAG}"
 CONTAINER="triton-ng-verify"
+INCOMPATIBLE_CONTAINER="${CONTAINER}-incompatible"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SO="${ROOT}/target/release/libtriton_custom_backend.so"
+VERSION_SO="${ROOT}/target/release/libtriton_version_backend.so"
 MODELS="${ROOT}/target/verify-repo"
 
 cd "$ROOT"
@@ -89,9 +92,10 @@ cleanup() {
   if ((status != 0)); then
     echo "== 服务器日志尾部 ==" >&2
     docker logs "${CONTAINER}" 2>&1 | tail -40 >&2 || true
+    docker logs "${INCOMPATIBLE_CONTAINER}" 2>&1 | tail -40 >&2 || true
     echo "容器 ${CONTAINER} 保留用于排查" >&2
   else
-    docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
+    docker rm -f "${CONTAINER}" "${INCOMPATIBLE_CONTAINER}" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
@@ -106,7 +110,7 @@ if grep -q -- '--allow-client-shm' <<<"${help_text}"; then
 fi
 
 docker run -d --name "${CONTAINER}" \
-  --gpus all --ipc=host \
+  --gpus all --ipc=host --cap-add SYS_NICE \
   --ulimit memlock=-1 --ulimit stack=67108864 \
   -p 8000:8000 -p 8001:8001 -p 8002:8002 \
   -v "${MODELS}:/models" \
@@ -116,6 +120,7 @@ docker run -d --name "${CONTAINER}" \
   --model-repository=/models \
   --model-control-mode=explicit \
   --backend-config=custom_backend,stage3-setting=verified \
+  --host-policy=stage3_policy,numa-node=0 \
   --log-verbose=1 \
   ${shm_flag[@]+"${shm_flag[@]}"} \
   --load-model=mnist \
@@ -147,4 +152,30 @@ cargo run --manifest-path=example/app/Cargo.toml --release | tee "${ROOT}/target
 echo "== 独立交叉核对 =="
 python3 scripts/cross_check.py
 
-echo "== 通过: ${IMAGE_TAG} =="
+echo "== 不兼容服务器拒绝加载后端 =="
+INCOMPATIBLE_IMAGE_TAG="24.02-py3"
+INCOMPATIBLE_IMAGE="nvcr.io/nvidia/tritonserver:${INCOMPATIBLE_IMAGE_TAG}"
+docker image inspect "${INCOMPATIBLE_IMAGE}" >/dev/null 2>&1 || docker pull "${INCOMPATIBLE_IMAGE}"
+docker rm -f "${INCOMPATIBLE_CONTAINER}" >/dev/null 2>&1 || true
+docker run -d --name "${INCOMPATIBLE_CONTAINER}" \
+  -v "${MODELS}:/models" \
+  -v "${VERSION_SO}:/opt/tritonserver/backends/custom_backend/libtriton_custom_backend.so" \
+  "${INCOMPATIBLE_IMAGE}" tritonserver \
+  --model-repository=/models \
+  --model-control-mode=explicit \
+  --load-model=tensor_echo \
+  --log-verbose=1 >/dev/null
+INCOMPATIBLE_LOG="${ROOT}/target/incompatible-server.log"
+for _ in $(seq 1 30); do
+  docker logs "${INCOMPATIBLE_CONTAINER}" >"${INCOMPATIBLE_LOG}" 2>&1 || true
+  if grep -q 'incompatible Triton backend API version: server 1.18, compiled 1.19' "${INCOMPATIBLE_LOG}"; then
+    break
+  fi
+  sleep 2
+done
+grep -q 'incompatible Triton backend API version: server 1.18, compiled 1.19' "${INCOMPATIBLE_LOG}" \
+  || fail "旧服务器没有报告双方 API 版本"
+grep -Eiq 'load failed for model|failed to load model|failed to load all models' "${INCOMPATIBLE_LOG}" \
+  || fail "旧服务器没有拒绝加载模型"
+
+echo "== 通过: ${IMAGE_TAG}；${INCOMPATIBLE_IMAGE_TAG} 负向验证通过 =="

@@ -1,5 +1,5 @@
 use std::str::FromStr;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use triton_ng::backend::Backend;
@@ -86,10 +86,15 @@ struct State {
 }
 
 static CANCELLED_STREAMS: AtomicI64 = AtomicI64::new(0);
+static STARTUP_SERVER_READS_CHECKED: AtomicBool = AtomicBool::new(false);
+static STARTUP_SERVER_READS_REJECTED: AtomicBool = AtomicBool::new(false);
+static CURRENT_INSTANCE_LOADS: AtomicUsize = AtomicUsize::new(0);
+static MAX_PARALLEL_INSTANCE_LOADS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Default)]
 struct Buffers {
     host_policy: String,
+    host_policy_json: String,
     ram: Mutex<Vec<RamBuffer>>,
     pinned: Mutex<Vec<PinnedRamBuffer>>,
     gpu: Mutex<Vec<GpuBuffer>>,
@@ -178,8 +183,12 @@ impl Backend for MnistBackend {
         if setting != "verified" {
             return Err(format!("unexpected stage3-setting '{setting}'").into());
         }
-        if !backend.artifacts()?.is_dir() {
-            return Err("backend artifacts directory is missing".into());
+        let artifacts = backend.artifacts()?;
+        if !artifacts.is_dir()
+            || artifacts.file_name().and_then(|name| name.to_str()) != Some("custom_backend")
+            || !artifacts.join("libtriton_custom_backend.so").is_file()
+        {
+            return Err("backend artifacts is not the custom_backend directory".into());
         }
         drop(backend.memory_manager()?.ram(1)?);
         backend.set_state(BackendState {
@@ -201,6 +210,19 @@ impl Backend for MnistBackend {
     }
 
     fn model_initialize(model: &Model) -> Result<(), Error> {
+        if !STARTUP_SERVER_READS_CHECKED.swap(true, Ordering::SeqCst) {
+            let server = model.get_server()?;
+            let rejected = !server.is_ready()?
+                && server.model_config("mnist_onnx", -1).is_err()
+                && server.model_statistics("", -1).is_err()
+                && server.model_index(true).is_err();
+            STARTUP_SERVER_READS_REJECTED.store(rejected, Ordering::SeqCst);
+            if !rejected {
+                return Err("a server read succeeded before the server became READY".into());
+            }
+        }
+
+        let model_name = model.name()?;
         model.set_state(State {
             mode: model.config_parameter_or("mode", Mode::Mnist)?,
             target_model: model.config_parameter_or("target_model", "mnist_onnx".to_string())?,
@@ -209,24 +231,49 @@ impl Backend for MnistBackend {
             held: AtomicI64::new(0),
             cancelled: AtomicI64::new(0),
         })?;
-        model.report_memory_usage(&[BufferAttributes::new(
-            MemoryType::Cpu,
-            0,
-            std::mem::size_of::<State>() as u64,
-        )?])?;
+        if model_name == "tensor_echo" {
+            model.report_memory_usage(&[
+                BufferAttributes::new(MemoryType::Cpu, 0, 64)?,
+                BufferAttributes::new(MemoryType::CpuPinned, 0, 128)?,
+            ])?;
+            model.report_memory_usage(&[BufferAttributes::new(MemoryType::Cpu, 0, 4096)?])?;
+        } else {
+            model.report_memory_usage(&[BufferAttributes::new(
+                MemoryType::Cpu,
+                0,
+                std::mem::size_of::<State>() as u64,
+            )?])?;
+        }
         Ok(())
     }
 
     fn model_instance_initialize(instance: &ModelInstance) -> Result<(), Error> {
+        let host_policy = instance.host_policy()?;
+        let is_echo = instance.model()?.name()? == "tensor_echo";
+        if is_echo {
+            let active = CURRENT_INSTANCE_LOADS.fetch_add(1, Ordering::SeqCst) + 1;
+            MAX_PARALLEL_INSTANCE_LOADS.fetch_max(active, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(25));
+        }
         instance.set_state(Buffers {
-            host_policy: instance.host_policy()?.name().to_string(),
+            host_policy: host_policy.name().to_string(),
+            host_policy_json: host_policy.config_json().to_string(),
             ..Default::default()
         })?;
-        instance.report_memory_usage(&[BufferAttributes::new(
-            MemoryType::Cpu,
-            0,
-            std::mem::size_of::<Buffers>() as u64,
-        )?])?;
+        if is_echo {
+            instance.report_memory_usage(&[
+                BufferAttributes::new(MemoryType::Cpu, 0, 64)?,
+                BufferAttributes::new(MemoryType::CpuPinned, 0, 128)?,
+            ])?;
+            instance.report_memory_usage(&[])?;
+            CURRENT_INSTANCE_LOADS.fetch_sub(1, Ordering::SeqCst);
+        } else {
+            instance.report_memory_usage(&[BufferAttributes::new(
+                MemoryType::Cpu,
+                0,
+                std::mem::size_of::<Buffers>() as u64,
+            )?])?;
+        }
         Ok(())
     }
 
@@ -264,6 +311,7 @@ async fn execute_echo(ctx: &Context, request: Request) -> Result<(), Error> {
 }
 
 fn execute_echo_direct(ctx: &Context, request: Request) -> Result<(), Error> {
+    let output_delay = request.parameter("output_delay")? == Some(Parameter::Bool(true));
     let fp16 = request.get_input("FP16")?;
     let fp16_shape = fp16.properties()?.shape;
     let fp16 = fp16.as_fp16_vec()?;
@@ -294,6 +342,9 @@ fn execute_echo_direct(ctx: &Context, request: Request) -> Result<(), Error> {
     response
         .create_output("FP16", DataType::Fp16, &fp16_shape)?
         .write_fp16_vec(&fp16)?;
+    if output_delay {
+        std::thread::sleep(Duration::from_millis(25));
+    }
     response
         .create_output("BF16", DataType::Bf16, &bf16_shape)?
         .write_bf16_vec(&bf16)?;
@@ -331,7 +382,10 @@ fn request_metadata(ctx: &Context, request: &Request) -> Result<String, Error> {
         ),
     };
     let flags = request.flags()?;
-    let target_model = &ctx.state::<State>()?.target_model;
+    let state = ctx.state::<State>()?;
+    let buffers = ctx.instance_state::<Buffers>()?;
+    let host_policy_json: serde_json::Value = serde_json::from_str(&buffers.host_policy_json)?;
+    let target_model = &state.target_model;
     let config: serde_json::Value =
         serde_json::from_str(&ctx.server().model_config(target_model, -1)?)?;
     let statistics: serde_json::Value =
@@ -359,7 +413,11 @@ fn request_metadata(ctx: &Context, request: &Request) -> Result<String, Error> {
         "int_parameter": parameter_json(request.parameter("int")?),
         "double_parameter": parameter_json(request.parameter("double")?),
         "string_parameter": parameter_json(request.parameter("string")?),
-        "host_policy": ctx.instance_state::<Buffers>()?.host_policy,
+        "host_policy": buffers.host_policy,
+        "host_policy_json": host_policy_json,
+        "parallel_instance_loads": MAX_PARALLEL_INSTANCE_LOADS.load(Ordering::SeqCst),
+        "server_reads_rejected_before_ready": STARTUP_SERVER_READS_REJECTED.load(Ordering::SeqCst),
+        "trace_available": request.view().trace()?.is_some(),
         "server_config": config["name"] == target_model.as_str(),
         "server_statistics": has_statistics,
         "server_index": has_index,
@@ -402,21 +460,44 @@ async fn execute_echo_proxy(
     inference.set_parameter("int", 99)?;
     inference.set_parameter("double", 2.5)?;
     inference.set_parameter("string", "downstream")?;
-    match correlation_kind {
-        "numeric" => inference.set_correlation_id(42)?,
-        "string" => inference.set_correlation_id_string("sequence-alpha")?,
+    let flags = match correlation_kind {
+        "numeric" => {
+            inference.set_correlation_id(42)?;
+            inference.set_priority(1)?;
+            RequestFlags {
+                sequence_start: true,
+                sequence_end: false,
+            }
+        }
+        "string" => {
+            inference.set_correlation_id_string("sequence-alpha")?;
+            inference.set_priority(0)?;
+            RequestFlags {
+                sequence_start: false,
+                sequence_end: true,
+            }
+        }
+        "overflow" => {
+            inference.set_correlation_id(43)?;
+            inference.set_priority(u64::MAX)?;
+            RequestFlags {
+                sequence_start: true,
+                sequence_end: true,
+            }
+        }
         other => return Err(format!("unknown proxy correlation kind '{other}'").into()),
-    }
-    inference.set_flags(RequestFlags {
-        sequence_start: true,
-        sequence_end: true,
-    })?;
+    };
+    inference.set_flags(flags)?;
     inference.set_timeout(5_000_000)?;
-    inference.set_priority(1)?;
 
     inference.add_input("REMOVE_ME", DataType::Uint8, &[1])?;
-    inference.append_input_data("REMOVE_ME", &[0])?;
+    let removed = Arc::new(ctx.memory().ram(1)?);
+    inference.append_input_buffer("REMOVE_ME", Arc::clone(&removed))?;
+    inference.append_input_buffer("REMOVE_ME", Arc::clone(&removed))?;
     inference.remove_input("REMOVE_ME")?;
+    if Arc::strong_count(&removed) != 1 {
+        return Err("removing an input did not release all of its buffers".into());
+    }
     inference.add_requested_output_into("REMOVE_ME", ctx.memory().ram(1)?)?;
     inference.remove_requested_output("REMOVE_ME")?;
     for &(name, _) in &ECHO_INPUTS {
@@ -454,6 +535,14 @@ async fn execute_mnist(ctx: Context, requests: Vec<Request>) -> Result<(), Error
         }
         if request.parameter("hold_until_cancelled")? == Some(Parameter::Bool(true)) {
             held.push(request);
+            continue;
+        }
+        if request.parameter("host_policy_input")? == Some(Parameter::Bool(true)) {
+            let image = request.get_input(IMAGE)?.as_bytes()?;
+            match digit_with_host_policy(&ctx, state, image).await {
+                Ok(digit) => respond(&ctx, state, request, digit)?,
+                Err(e) => request.respond_error(&e.to_string())?,
+            }
             continue;
         }
         if let Some(Parameter::String(memory)) = request.parameter("memory")? {
@@ -535,10 +624,20 @@ fn stream_flag(value: f32, name: &str) -> Result<bool, Error> {
 async fn execute_decoupled(request: Request) -> Result<(), Error> {
     let config = StreamConfig::parse(&request.get_input("CONFIG")?.as_fp32_vec()?)?;
     if config.direct_final {
+        if config.drop_factory {
+            drop(request);
+            return Ok(());
+        }
         let mut response = Response::new(request)?;
-        response
-            .create_output("OUTPUT", DataType::Fp32, &[1])?
-            .write_fp32_vec(&[0.0])?;
+        if config.drop_response {
+            drop(response);
+            return Ok(());
+        }
+        if config.chunks > 0 {
+            response
+                .create_output("OUTPUT", DataType::Fp32, &[1])?
+                .write_fp32_vec(&[0.0])?;
+        }
         response.send()?;
         return Ok(());
     }
@@ -720,6 +819,46 @@ fn respond_stream(request: Request, reply: StreamReply) -> Result<(), Error> {
     Ok(())
 }
 
+async fn digit_with_host_policy(
+    ctx: &Context,
+    state: &State,
+    image: Vec<u8>,
+) -> Result<i32, Error> {
+    let policy_image: Vec<u8> = (0..784).flat_map(|_| 1.0_f32.to_le_bytes()).collect();
+    let host_policy = &ctx.instance_state::<Buffers>()?.host_policy;
+    let mut mixed = InferenceRequest::new(ctx.server(), &state.target_model, -1)?;
+    mixed.add_input(IMAGE, DataType::Fp32, &IMAGE_SHAPE)?;
+    mixed.append_input_data(IMAGE, &image)?;
+    mixed.append_input_data_with_host_policy(IMAGE, &policy_image, host_policy)?;
+    mixed.add_requested_output(LOGITS)?;
+
+    let mixed_logits = ctx
+        .server()
+        .infer_async(mixed)
+        .await?
+        .output(LOGITS)?
+        .as_fp32_vec()?;
+    let default_logits = ctx
+        .server()
+        .infer_async(host_inference(ctx, state, image)?)
+        .await?
+        .output(LOGITS)?
+        .as_fp32_vec()?;
+    let policy_logits = ctx
+        .server()
+        .infer_async(host_inference(ctx, state, policy_image)?)
+        .await?
+        .output(LOGITS)?
+        .as_fp32_vec()?;
+    if mixed_logits != policy_logits {
+        return Err("BLS did not select the host-policy input buffer".into());
+    }
+    if mixed_logits == default_logits {
+        return Err("host-policy test inputs produced identical logits".into());
+    }
+    argmax(&mixed_logits)
+}
+
 fn host_inference(ctx: &Context, state: &State, image: Vec<u8>) -> Result<InferenceRequest, Error> {
     let mut inference = InferenceRequest::new(ctx.server(), &state.target_model, -1)?;
     inference.add_input_with_data(IMAGE, DataType::Fp32, &IMAGE_SHAPE, image)?;
@@ -848,6 +987,8 @@ fn respond(ctx: &Context, state: &State, request: Request, digit: i32) -> Result
         "gpu_buffers_allocated",
         buffers.gpu_allocated.load(Ordering::SeqCst),
     )?;
+    response.set_parameter("host_policy_name", buffers.host_policy.clone())?;
+    response.set_parameter("host_policy_json", buffers.host_policy_json.clone())?;
     response.send()?;
     Ok(())
 }

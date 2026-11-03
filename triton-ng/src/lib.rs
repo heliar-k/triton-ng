@@ -49,7 +49,24 @@ pub(crate) mod response_allocator;
 #[path = "server.rs"]
 pub mod server;
 #[path = "statistics.rs"]
+#[cfg(feature = "response-statistics")]
 pub(crate) mod statistics;
+
+#[cfg(not(feature = "response-statistics"))]
+pub(crate) mod statistics {
+    use crate::error::TritonError;
+    use crate::request::Request;
+    use crate::timing::ResponseTimestamps;
+
+    pub(crate) fn report_response(
+        _request: &Request,
+        _factory: *mut triton_ng_sys::TRITONBACKEND_ResponseFactory,
+        _timing: ResponseTimestamps,
+        _error: Option<&TritonError>,
+    ) -> Result<(), TritonError> {
+        Ok(())
+    }
+}
 #[path = "timing.rs"]
 pub(crate) mod timing;
 #[path = "types.rs"]

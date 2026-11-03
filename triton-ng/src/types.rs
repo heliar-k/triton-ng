@@ -263,7 +263,7 @@ impl From<String> for Parameter {
 
 #[cfg(test)]
 mod tests {
-    use super::Parameter;
+    use super::{Parameter, RequestFlags};
     use std::ffi::{CString, c_void};
     use triton_ng_sys::*;
 
@@ -303,6 +303,39 @@ mod tests {
             )
         };
         assert_eq!(string, Ok(Parameter::String("hello".to_string())));
+    }
+
+    #[test]
+    fn request_flags_map_each_sequence_bit() {
+        let cases = [
+            (RequestFlags::default(), 0),
+            (
+                RequestFlags {
+                    sequence_start: true,
+                    sequence_end: false,
+                },
+                tritonserver_requestflag_enum_TRITONSERVER_REQUEST_FLAG_SEQUENCE_START,
+            ),
+            (
+                RequestFlags {
+                    sequence_start: false,
+                    sequence_end: true,
+                },
+                tritonserver_requestflag_enum_TRITONSERVER_REQUEST_FLAG_SEQUENCE_END,
+            ),
+            (
+                RequestFlags {
+                    sequence_start: true,
+                    sequence_end: true,
+                },
+                tritonserver_requestflag_enum_TRITONSERVER_REQUEST_FLAG_SEQUENCE_START
+                    | tritonserver_requestflag_enum_TRITONSERVER_REQUEST_FLAG_SEQUENCE_END,
+            ),
+        ];
+        for (flags, raw) in cases {
+            assert_eq!(flags.to_sys(), raw);
+            assert_eq!(RequestFlags::from_sys(raw), flags);
+        }
     }
 
     #[test]

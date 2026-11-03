@@ -8,6 +8,10 @@ use triton_ng_client::{
     TritonClientConfig,
 };
 
+const ECHO_OUTPUTS: [&str; 9] = [
+    "FP16", "BF16", "FP64", "INT8", "UINT8", "UINT16", "UINT32", "BOOL", "METADATA",
+];
+
 #[tokio::test]
 async fn typed_tensors_round_trip_through_the_custom_backend() -> Result<()> {
     let client = client().await?;
@@ -29,17 +33,17 @@ async fn typed_tensors_round_trip_through_the_custom_backend() -> Result<()> {
         InferInput::uint32("UINT32", vec![2], vec![0, 4_000_000_000]),
         InferInput::bool("BOOL", vec![3], vec![true, false, true]),
     ];
-    let output_names = [
-        "FP16", "BF16", "FP64", "INT8", "UINT8", "UINT16", "UINT32", "BOOL", "METADATA",
-    ];
-
+    let before = response_compute_infer(&client).await?;
     let response = client
         .infer(
             "tensor_echo",
             None,
             inputs,
-            output_names,
-            InferOptions::default(),
+            ECHO_OUTPUTS,
+            InferOptions {
+                parameters: HashMap::from([("output_delay".to_string(), Parameter::Bool(true))]),
+                ..Default::default()
+            },
         )
         .await?;
 
@@ -61,6 +65,9 @@ async fn typed_tensors_round_trip_through_the_custom_backend() -> Result<()> {
             .with_context(|| format!("output {name} not found"))?;
         assert_eq!(output.data, expected, "output {name}");
     }
+    let after = response_compute_infer(&client).await?;
+    assert_eq!(after.0, before.0 + 1);
+    assert!(after.1 >= before.1 + 25_000_000);
     Ok(())
 }
 
@@ -101,6 +108,15 @@ async fn request_and_server_metadata_are_readable() -> Result<()> {
     assert_eq!(metadata["double_parameter"], 0.5);
     assert_eq!(metadata["string_parameter"], "client");
     assert_eq!(metadata["host_policy"], "cpu");
+    assert_eq!(metadata["host_policy_json"], serde_json::json!({"cpu": {}}));
+    assert!(
+        metadata["parallel_instance_loads"]
+            .as_u64()
+            .context("parallel_instance_loads is not an integer")?
+            >= 2
+    );
+    assert_eq!(metadata["server_reads_rejected_before_ready"], true);
+    assert_eq!(metadata["trace_available"], true);
     assert_eq!(metadata["server_config"], true);
     assert_eq!(metadata["server_statistics"], true);
     assert_eq!(metadata["server_index"], true);
@@ -112,7 +128,7 @@ async fn bls_request_forwards_numeric_metadata_and_typed_data() -> Result<()> {
     let metadata = infer_proxy("numeric").await?;
     assert_eq!(metadata["correlation_id"], 42);
     assert!(metadata["correlation_id_string"].is_null());
-    assert_bls_metadata(&metadata);
+    assert_bls_metadata(&metadata, true, false);
     Ok(())
 }
 
@@ -121,7 +137,75 @@ async fn bls_request_forwards_string_correlation_id() -> Result<()> {
     let metadata = infer_proxy("string").await?;
     assert!(metadata["correlation_id"].is_null());
     assert_eq!(metadata["correlation_id_string"], "sequence-alpha");
-    assert_bls_metadata(&metadata);
+    assert_bls_metadata(&metadata, false, true);
+    Ok(())
+}
+
+#[tokio::test]
+async fn bls_request_accepts_priority_above_the_model_limit() -> Result<()> {
+    let metadata = infer_proxy("overflow").await?;
+    assert_eq!(metadata["correlation_id"], 43);
+    assert_bls_metadata(&metadata, true, true);
+    Ok(())
+}
+
+#[tokio::test]
+async fn bls_request_returns_every_typed_input() -> Result<()> {
+    let response = infer_proxy_response("numeric").await?;
+    let expected = [
+        ("FP16", OutputData::Fp16(0x3c00u16.to_le_bytes().to_vec())),
+        ("BF16", OutputData::Bf16(0x3f80u16.to_le_bytes().to_vec())),
+        ("FP64", OutputData::Fp64(vec![1.25])),
+        ("INT8", OutputData::Int8(vec![-1])),
+        ("UINT8", OutputData::Uint8(vec![1])),
+        ("UINT16", OutputData::Uint16(vec![1])),
+        ("UINT32", OutputData::Uint32(vec![1])),
+        ("BOOL", OutputData::Bool(vec![true])),
+    ];
+    for (name, expected) in expected {
+        let output = response
+            .outputs
+            .iter()
+            .find(|output| output.name == name)
+            .with_context(|| format!("output {name} not found"))?;
+        assert_eq!(output.data, expected, "output {name}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn unsampled_request_has_no_trace_view() -> Result<()> {
+    let client = client().await?;
+    let settings = client
+        .trace_settings(
+            HashMap::from([("trace_level".to_string(), vec!["OFF".to_string()])]),
+            Some("tensor_echo"),
+            None,
+        )
+        .await?;
+    let response = client
+        .infer(
+            "tensor_echo",
+            None,
+            metadata_inputs(),
+            ["METADATA"],
+            InferOptions::default(),
+        )
+        .await;
+    client
+        .trace_settings(
+            HashMap::from([("trace_level".to_string(), vec!["TIMESTAMPS".to_string()])]),
+            Some("tensor_echo"),
+            None,
+        )
+        .await?;
+    assert_eq!(
+        settings.get("trace_level").map(Vec::as_slice),
+        Some(&["OFF".to_string()][..]),
+        "{settings:?}"
+    );
+    let metadata = metadata(&response?)?;
+    assert_eq!(metadata["trace_available"], false);
     Ok(())
 }
 
@@ -147,14 +231,34 @@ async fn client() -> Result<TritonClient> {
     Ok(TritonClient::new(TritonClientConfig::new(url)).await?)
 }
 
+async fn response_compute_infer(client: &TritonClient) -> Result<(u64, u64)> {
+    let stats = client
+        .model_statistics(Some("tensor_echo"), None, None)
+        .await?
+        .into_iter()
+        .find(|stats| stats.name() == "tensor_echo")
+        .context("tensor_echo statistics not found")?
+        .into_proto();
+    let duration = stats
+        .response_stats
+        .get("0")
+        .and_then(|stats| stats.compute_infer)
+        .map_or((0, 0), |duration| (duration.count, duration.ns));
+    Ok(duration)
+}
+
 async fn infer_proxy(kind: &str) -> Result<Value> {
+    metadata(&infer_proxy_response(kind).await?)
+}
+
+async fn infer_proxy_response(kind: &str) -> Result<InferResponse> {
     let client = client().await?;
-    let response = client
+    Ok(client
         .infer(
             "tensor_echo",
             None,
             metadata_inputs(),
-            ["METADATA"],
+            ECHO_OUTPUTS,
             InferOptions {
                 parameters: HashMap::from([(
                     "proxy".to_string(),
@@ -163,14 +267,13 @@ async fn infer_proxy(kind: &str) -> Result<Value> {
                 ..Default::default()
             },
         )
-        .await?;
-    metadata(&response)
+        .await?)
 }
 
-fn assert_bls_metadata(metadata: &Value) {
+fn assert_bls_metadata(metadata: &Value, sequence_start: bool, sequence_end: bool) {
     assert_eq!(metadata["id"], "");
-    assert_eq!(metadata["sequence_start"], true);
-    assert_eq!(metadata["sequence_end"], true);
+    assert_eq!(metadata["sequence_start"], sequence_start);
+    assert_eq!(metadata["sequence_end"], sequence_end);
     assert_eq!(metadata["timeout"], 5_000_000);
     assert_eq!(metadata["bool_parameter"], true);
     assert_eq!(metadata["int_parameter"], 99);

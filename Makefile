@@ -21,8 +21,9 @@ format:
 lint:
 	cargo clippy
 
+# 集成测试共享 Triton 的统计与 trace 设置，串行执行避免互相影响。
 tests:
-	cargo nextest run --workspace --no-fail-fast
+	cargo nextest run --workspace --no-fail-fast --test-threads=1
 
 update-submodules:
 	git submodule update --init --recursive
@@ -37,6 +38,7 @@ publish:
 
 build:
 	cargo build --release
+	cargo build --release --package triton-version-backend
 
 download-model:
 	mkdir -p models/mnist/1

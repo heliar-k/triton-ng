@@ -11,6 +11,8 @@ services:
               count: all
               capabilities: [gpu]
     ipc: host
+    cap_add:
+      - SYS_NICE
     ulimits:
       memlock: -1
       stack: 67108864
@@ -20,6 +22,7 @@ services:
       --log-verbose=1
       --model-control-mode=explicit
       --backend-config=custom_backend,stage3-setting=verified
+      --host-policy=stage3_policy,numa-node=0
       --load-model=mnist
       --load-model=mnist_onnx
       --load-model=identity_gpu

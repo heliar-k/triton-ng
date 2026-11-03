@@ -11,6 +11,10 @@ rust-version = { workspace = true }
 categories = { workspace = true }
 description = "Safe Rust API for writing custom NVIDIA Triton Inference Server backends."
 
+[features]
+default = ["response-statistics"]
+response-statistics = []
+
 [dependencies]
 byteorder = { workspace = true }
 libc = { workspace = true }

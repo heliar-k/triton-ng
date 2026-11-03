@@ -10,6 +10,7 @@ instance_group [
   {
     count: 1
     kind: KIND_CPU
+    host_policy: "stage3_policy"
   }
 ]
 
