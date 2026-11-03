@@ -101,6 +101,12 @@ impl MemoryManager {
             model.as_ptr(),
             &mut _
         ))?;
+        Self::of_backend(backend)
+    }
+
+    pub(crate) fn of_backend(
+        backend: *mut triton_ng_sys::TRITONBACKEND_Backend,
+    ) -> Result<Self, TritonError> {
         let ptr = triton_call!(triton_ng_sys::TRITONBACKEND_BackendMemoryManager(
             backend,
             &mut _

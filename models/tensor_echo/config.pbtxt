@@ -1,0 +1,36 @@
+name: "tensor_echo"
+backend: "custom_backend"
+max_batch_size: 0
+
+input [
+  { name: "FP16" data_type: TYPE_FP16 dims: [ -1 ] },
+  { name: "BF16" data_type: TYPE_BF16 dims: [ -1 ] },
+  { name: "FP64" data_type: TYPE_FP64 dims: [ -1 ] },
+  { name: "INT8" data_type: TYPE_INT8 dims: [ -1 ] },
+  { name: "UINT8" data_type: TYPE_UINT8 dims: [ -1 ] },
+  { name: "UINT16" data_type: TYPE_UINT16 dims: [ -1 ] },
+  { name: "UINT32" data_type: TYPE_UINT32 dims: [ -1 ] },
+  { name: "BOOL" data_type: TYPE_BOOL dims: [ -1 ] }
+]
+
+output [
+  { name: "FP16" data_type: TYPE_FP16 dims: [ -1 ] },
+  { name: "BF16" data_type: TYPE_BF16 dims: [ -1 ] },
+  { name: "FP64" data_type: TYPE_FP64 dims: [ -1 ] },
+  { name: "INT8" data_type: TYPE_INT8 dims: [ -1 ] },
+  { name: "UINT8" data_type: TYPE_UINT8 dims: [ -1 ] },
+  { name: "UINT16" data_type: TYPE_UINT16 dims: [ -1 ] },
+  { name: "UINT32" data_type: TYPE_UINT32 dims: [ -1 ] },
+  { name: "BOOL" data_type: TYPE_BOOL dims: [ -1 ] },
+  { name: "METADATA" data_type: TYPE_STRING dims: [ 1 ] }
+]
+
+parameters: {
+  key: "mode"
+  value: { string_value: "echo" }
+}
+
+parameters: {
+  key: "target_model"
+  value: { string_value: "tensor_echo" }
+}

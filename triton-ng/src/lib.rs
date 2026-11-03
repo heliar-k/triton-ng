@@ -88,7 +88,7 @@ pub use triton_ng_macros::backend;
 #[doc(hidden)]
 pub mod __macro_support {
     use crate::backend::Backend;
-    use crate::backend_handle::BackendHandle;
+    use crate::backend_handle::{BackendAttributes, BackendHandle};
     use crate::error::Error;
     use crate::executor::InstanceExecutor;
     use crate::model::Model;
@@ -141,10 +141,28 @@ pub mod __macro_support {
         Ok(())
     }
 
-    /// TRITONBACKEND_Finalize.
+    /// TRITONBACKEND_Finalize. Drops backend state after the hook.
     pub unsafe fn finalize<B: Backend>(backend: *mut c_void) -> ErrorPtr {
         let backend = unsafe { backend_handle(backend) };
-        into_error_ptr(catch(|| B::finalize(&backend)))
+        let result = catch(|| B::finalize(&backend));
+        if let Err(error) = backend.clear_state() {
+            crate::log::error(&format!("failed to clear backend state: {error}"));
+        }
+        into_error_ptr(result)
+    }
+
+    /// TRITONBACKEND_GetBackendAttribute.
+    pub unsafe fn backend_attributes<B: Backend>(
+        backend: *mut c_void,
+        attributes: *mut c_void,
+    ) -> ErrorPtr {
+        let backend = unsafe { backend_handle(backend) };
+        let mut attributes = unsafe {
+            BackendAttributes::from_ptr(
+                attributes as *mut triton_ng_sys::TRITONBACKEND_BackendAttribute,
+            )
+        };
+        into_error_ptr(catch(|| B::attributes(&backend, &mut attributes)))
     }
 
     /// TRITONBACKEND_ModelInitialize.
@@ -457,6 +475,7 @@ mod tests {
             Context,
             MemoryManager,
             InstanceHandle,
+            HostPolicy,
             RamBuffer,
             PinnedRamBuffer,
             GpuBuffer,
@@ -480,6 +499,7 @@ mod tests {
             Model,
             ModelInstance,
             BackendHandle,
+            BackendAttributes<'static>,
             BufferAttributes,
             RequestTrace<'static>,
             RequestView<'static>,

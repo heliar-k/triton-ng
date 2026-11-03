@@ -20,10 +20,17 @@ impl Message {
     }
 
     pub(crate) fn to_json(&self) -> Result<String, TritonError> {
+        Self::borrowed_json(self.ptr)
+    }
+
+    /// Serializes a message borrowed from Triton without taking ownership.
+    pub(crate) fn borrowed_json(
+        ptr: *mut triton_ng_sys::TRITONSERVER_Message,
+    ) -> Result<String, TritonError> {
         let mut base: *const c_char = std::ptr::null();
         let mut byte_size: usize = 0;
         triton_call!(triton_ng_sys::TRITONSERVER_MessageSerializeToJson(
-            self.ptr,
+            ptr,
             &mut base,
             &mut byte_size,
         ))?;

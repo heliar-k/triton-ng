@@ -19,11 +19,13 @@ services:
       --model-repository=/models
       --log-verbose=1
       --model-control-mode=explicit
+      --backend-config=custom_backend,stage3-setting=verified
       --load-model=mnist
       --load-model=mnist_onnx
       --load-model=identity_gpu
       --load-model=decoupled
       --load-model=stream_proxy
+      --load-model=tensor_echo
       --trace-config triton,file=/traces/trace.json
       --trace-config triton,log-frequency=1
       --trace-config rate=1

@@ -128,6 +128,120 @@ impl Input<'_> {
         decode_le(&self.buffer()?, i64::from_le_bytes)
     }
 
+    /// Decodes an FP16 tensor into raw `u16` bit patterns. Each value uses
+    /// the IEEE 754 binary16 layout in host byte order; this method does not
+    /// convert it to `f32`.
+    ///
+    /// Fails when a buffer is not in host memory or its byte size is odd.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let half_bits = request.get_input("HALVES")?.as_fp16_vec()?;
+    /// ```
+    pub fn as_fp16_vec(&self) -> Result<Vec<u16>, Error> {
+        decode_le(&self.buffer()?, u16::from_le_bytes)
+    }
+
+    /// Decodes a BF16 tensor into raw `u16` bit patterns. Each value uses the
+    /// bfloat16 layout in host byte order; this method does not convert it to
+    /// `f32`.
+    ///
+    /// Fails when a buffer is not in host memory or its byte size is odd.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let bfloat_bits = request.get_input("BFLOATS")?.as_bf16_vec()?;
+    /// ```
+    pub fn as_bf16_vec(&self) -> Result<Vec<u16>, Error> {
+        decode_le(&self.buffer()?, u16::from_le_bytes)
+    }
+
+    /// Decodes every element of an FP64 tensor.
+    ///
+    /// Fails when a buffer is not in host memory or its byte size is not a
+    /// multiple of eight.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let values = request.get_input("VALUES")?.as_fp64_vec()?;
+    /// ```
+    pub fn as_fp64_vec(&self) -> Result<Vec<f64>, Error> {
+        decode_le(&self.buffer()?, f64::from_le_bytes)
+    }
+
+    /// Decodes every element of an INT8 tensor.
+    ///
+    /// Fails when a buffer is not in host memory or its buffers do not match
+    /// the tensor byte size.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let values = request.get_input("VALUES")?.as_i8_vec()?;
+    /// ```
+    pub fn as_i8_vec(&self) -> Result<Vec<i8>, Error> {
+        decode_le(&self.buffer()?, i8::from_le_bytes)
+    }
+
+    /// Decodes every element of a UINT8 tensor.
+    ///
+    /// Fails when a buffer is not in host memory or its buffers do not match
+    /// the tensor byte size.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let values = request.get_input("VALUES")?.as_u8_vec()?;
+    /// ```
+    pub fn as_u8_vec(&self) -> Result<Vec<u8>, Error> {
+        self.buffer()
+    }
+
+    /// Decodes every element of a UINT16 tensor.
+    ///
+    /// Fails when a buffer is not in host memory or its byte size is odd.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let values = request.get_input("VALUES")?.as_u16_vec()?;
+    /// ```
+    pub fn as_u16_vec(&self) -> Result<Vec<u16>, Error> {
+        decode_le(&self.buffer()?, u16::from_le_bytes)
+    }
+
+    /// Decodes every element of a UINT32 tensor.
+    ///
+    /// Fails when a buffer is not in host memory or its byte size is not a
+    /// multiple of four.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let values = request.get_input("VALUES")?.as_u32_vec()?;
+    /// ```
+    pub fn as_u32_vec(&self) -> Result<Vec<u32>, Error> {
+        decode_le(&self.buffer()?, u32::from_le_bytes)
+    }
+
+    /// Decodes every element of a BOOL tensor. Zero becomes `false` and every
+    /// other byte becomes `true`.
+    ///
+    /// Fails when a buffer is not in host memory or its buffers do not match
+    /// the tensor byte size.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let values = request.get_input("MASK")?.as_bool_vec()?;
+    /// ```
+    pub fn as_bool_vec(&self) -> Result<Vec<bool>, Error> {
+        Ok(self.buffer()?.into_iter().map(|value| value != 0).collect())
+    }
+
     pub fn properties(&self) -> Result<InputProperties, Error> {
         let mut name = std::ptr::null();
         let mut datatype = 0u32;

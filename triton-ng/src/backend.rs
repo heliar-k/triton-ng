@@ -1,4 +1,4 @@
-use crate::backend_handle::BackendHandle;
+use crate::backend_handle::{BackendAttributes, BackendHandle};
 use crate::error::Error;
 use crate::executor::Context;
 use crate::model::Model;
@@ -58,6 +58,39 @@ pub trait Backend {
         Ok(())
     }
 
+    /// Declares backend attributes used when Triton normalizes model configs.
+    /// This optional hook corresponds to `TRITONBACKEND_GetBackendAttribute`
+    /// and may be called repeatedly between [`Backend::initialize`] and
+    /// [`Backend::finalize`]. Every call must declare the complete same set of
+    /// attributes, without relying on a previous call.
+    ///
+    /// Setting parallel loading to true permits concurrent
+    /// [`Backend::model_instance_initialize`] calls for different instances.
+    ///
+    /// # Errors
+    ///
+    /// Returning an error makes Triton ignore every attribute set by that
+    /// call. An error during backend creation rejects the backend load.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// fn attributes(
+    ///     backend: &BackendHandle,
+    ///     attributes: &mut BackendAttributes,
+    /// ) -> Result<(), Error> {
+    ///     attributes.add_preferred_instance_group(InstanceKind::Cpu, 1, &[])?;
+    ///     attributes.set_parallel_model_instance_loading(true)?;
+    ///     Ok(())
+    /// }
+    /// ```
+    fn attributes(
+        _backend: &BackendHandle,
+        _attributes: &mut BackendAttributes,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Initialize for a model. This function is optional, a backend is not
     /// required to implement it. This function is called once when a model
     /// that uses the backend is loaded, before any of its instances is
@@ -90,7 +123,9 @@ pub trait Backend {
     /// the model parameters `worker_threads` (threads of the runtime, 1 by
     /// default) and `max_batches_in_flight` (see
     /// [`Backend::model_instance_execute`]). The runtime is started before
-    /// this function and stopped again when it fails.
+    /// this function and stopped again when it fails. When parallel instance
+    /// loading is enabled in [`Backend::attributes`], different instances may
+    /// enter this hook concurrently.
     ///
     /// Corresponds to TRITONBACKEND_ModelInstanceInitialize.
     fn model_instance_initialize(_instance: &ModelInstance) -> Result<(), Error> {

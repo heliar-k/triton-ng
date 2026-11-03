@@ -132,12 +132,14 @@ C 实现的 `TRITONBACKEND_ResponseFactoryDelete` 只释放工厂自身的 `shar
 
 - `BackendHandle` 增加 `config()`（`TRITONBACKEND_BackendConfig`）、`artifacts()`（`TRITONBACKEND_BackendArtifacts`）、`memory_manager()`（`TRITONBACKEND_BackendMemoryManager`）、`set_state` / `state`（`TRITONBACKEND_BackendSetState` / `TRITONBACKEND_BackendState`）。
 - 后端属性走一个由后端导出的回调：`TRITONBACKEND_GetBackendAttribute` 在头文件里标 `TRITONBACKEND_ISPEC`，Triton 用 `dlsym` 查找，可选，并且在 `Initialize` 与 `Finalize` 之间可能被调用多次。`Backend` trait 增加可选方法 `fn attributes(backend: &BackendHandle, attributes: &mut BackendAttributes) -> Result<(), Error>`，由宏导出对应符号。回调可能重复触发，实现必须幂等：每次调用都重新声明同一组属性，不依赖上一次调用的状态。`BackendAttributes` 提供 `add_preferred_instance_group(kind, count, device_ids)` 与 `set_parallel_model_instance_loading(bool)`。
-- `ModelInstance` 增加 `host_policy()`（`TRITONBACKEND_ModelInstanceHostPolicy`）。
-- `RequestView` 增加 `id`、`correlation_id`、`correlation_id_string`、`flags`、`timeout` 的读取。`flags` 给出 `SEQUENCE_START` 与 `SEQUENCE_END` 两个布尔值，不直接暴露 C 位掩码。
-- `InferenceRequest` 增加 `set_parameter`（布尔、整数、浮点、字符串四种）、`set_correlation_id`、`set_correlation_id_string`、`set_flags`、`set_timeout`、`set_priority`、`remove_input`、`remove_requested_output`、`append_input_data_with_host_policy`。
-  `remove_input` 与 `remove_requested_output` 必须同步清理请求里的 `buffers` 与 `outputs` 记账，否则释放后仍持有已被 Triton 遗忘的缓冲。
-- `Server` 增加后端侧会用到的读接口：`model_config`（`TRITONSERVER_ServerModelConfig`）、`model_statistics`（`TRITONSERVER_ServerModelStatistics`）、`model_index`（`TRITONSERVER_ServerModelIndex`）。
+- `ModelInstance` 增加 `host_policy()`（`TRITONBACKEND_ModelInstanceHostPolicy`），返回 `HostPolicy`。`HostPolicy` 给出策略名称与完整 JSON 设置；C 接口把名称放在 JSON 唯一的顶层键里。
+- `RequestView` 增加 `id`、`correlation_id`、`correlation_id_string`、`flags`、`timeout` 的读取。`flags` 返回具有 `sequence_start` 与 `sequence_end` 两个布尔字段的 `RequestFlags`，不直接暴露 C 位掩码。timeout 使用微秒，对应 `TRITONBACKEND_InferenceRequestTimeoutMicroseconds`。
+- `InferenceRequest` 增加 `set_parameter`（布尔、整数、浮点、字符串四种）、`set_correlation_id`、`set_correlation_id_string`、`set_flags`、`set_timeout`、`set_priority`、`remove_input`、`remove_requested_output`、`append_input_data_with_host_policy`。`set_priority` 使用 `TRITONSERVER_InferenceRequestSetPriorityUInt64`，0 或超过模型上限时由 Triton 换成模型默认优先级。
+  `remove_input` 与 `remove_requested_output` 必须同步清理请求里的 `buffers` 与 `outputs` 记账，否则释放后仍持有已被 Triton 遗忘的缓冲。输入缓冲按输入名称分组，C 删除成功之后删除对应的一组。
+- `Server` 增加后端侧会用到的读接口：`model_config`（`TRITONSERVER_ServerModelConfig`）、`model_statistics`（`TRITONSERVER_ServerModelStatistics`）、`model_index`（`TRITONSERVER_ServerModelIndex`）。这些接口要求服务器已经进入 READY，不能在启动时的模型加载钩子里调用。
 - `Input` 与 `Output` 补 fp16、bf16、fp64、int8、uint8、uint16、uint32、bool 的读写方法。fp16 与 bf16 用 `u16` 位模式承载，不引入半精度依赖，方法文档里写明位的含义。
+
+`BackendConfig` 与 `ModelInstanceHostPolicy` 返回的 `TRITONSERVER_Message` 由 Triton 持有，Rust 只序列化读取，不能调用 `TRITONSERVER_MessageDelete`；`Server` 的三个读接口返回调用方持有的消息，沿用现有 `Message` 的 Drop 释放。`BackendAttributes` 只借用回调参数，回调返回后失效。`BackendHandle` 的状态沿用模型状态的类型擦除存储，并在 `Backend::finalize` 返回后由宏支持代码清理。
 
 ### 阶段 4：输入输出的数据面
 

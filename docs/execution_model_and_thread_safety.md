@@ -26,7 +26,14 @@ need from it in `model_initialize`.
 buffers of the instance's device. Batches of the instance get it through
 `Context::instance_state::<T>()`. The runtime of the instance starts before
 `model_instance_initialize` and is stopped again when it fails; the instance state is dropped after
-`model_instance_finalize`, once every batch of the instance has finished.
+`model_instance_finalize`, once every batch of the instance has finished. Enabling parallel loading
+in `Backend::attributes` allows different instances to enter their initialization hooks
+concurrently.
+
+`Backend::initialize` can store one value shared by the whole backend library with
+`BackendHandle::set_state`. The attributes and finalize hooks read it with `BackendHandle::state`;
+the value is dropped after `Backend::finalize`. `Backend::attributes` may be called repeatedly and
+must declare the same complete attributes each time.
 
 **Requests are owned by the backend.** `model_instance_execute` gets `Vec<Request>`. A request can
 be answered from any thread of the runtime. `Request::view` returns a read-only `RequestView<'_>`
@@ -103,6 +110,8 @@ bounded by what Triton guarantees. Backend code only sees these types, never raw
 | `Context` | borrows the server, memory manager and states | nothing | yes | yes | `Clone`; valid while the model is loaded |
 | `InstanceHandle` (crate-internal) | borrows the model instance | nothing | yes | yes | `Clone`; used by request and response statistics |
 | `Model`, `ModelInstance`, `BackendHandle` | borrow the model, instance, backend | nothing | no | no | used only in the init and finalize hooks |
+| `BackendAttributes<'_>` | borrows the attributes of one callback | nothing | no | no | valid only during `Backend::attributes` |
+| `HostPolicy` | owns a policy name and JSON string | nothing | yes | yes | returned by `ModelInstance::host_policy` |
 
 A unit test in the crate (`thread_safety_of_every_handle_is_as_documented`) checks the public rows:
 it does not compile when a type is `Send` or `Sync` where this table says it is not, or the other

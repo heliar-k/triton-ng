@@ -4,9 +4,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use triton_ng::backend::Backend;
 use triton_ng::{
-    BackendHandle, BufferAttributes, Context, DataType, Error, GpuBuffer, InferenceFuture,
-    InferenceRequest, MemoryManager, MemoryType, Model, ModelInstance, Parameter, PinnedRamBuffer,
-    RamBuffer, Request, Response, ResponseFactory, UninitGpuBuffer,
+    BackendAttributes, BackendHandle, BufferAttributes, Context, DataType, Error, GpuBuffer,
+    InferenceFuture, InferenceRequest, InstanceKind, MemoryManager, MemoryType, Model,
+    ModelInstance, Parameter, PinnedRamBuffer, RamBuffer, Request, RequestFlags, Response,
+    ResponseFactory, UninitGpuBuffer,
 };
 
 const IMAGE: &str = "Input3";
@@ -15,6 +16,16 @@ const LOGITS: &str = "Plus214_Output_0";
 const LOGITS_BYTES: usize = 10 * 4;
 const IDENTITY_INPUT: &str = "INPUT0";
 const IDENTITY_OUTPUT: &str = "OUTPUT0";
+const ECHO_INPUTS: [(&str, DataType); 8] = [
+    ("FP16", DataType::Fp16),
+    ("BF16", DataType::Bf16),
+    ("FP64", DataType::Fp64),
+    ("INT8", DataType::Int8),
+    ("UINT8", DataType::Uint8),
+    ("UINT16", DataType::Uint16),
+    ("UINT32", DataType::Uint32),
+    ("BOOL", DataType::Bool),
+];
 
 #[derive(Clone, Copy)]
 enum OutputMemory {
@@ -45,6 +56,7 @@ enum Mode {
     Mnist,
     Decoupled,
     StreamProxy,
+    Echo,
 }
 
 impl FromStr for Mode {
@@ -55,9 +67,14 @@ impl FromStr for Mode {
             "mnist" => Ok(Self::Mnist),
             "decoupled" => Ok(Self::Decoupled),
             "stream_proxy" => Ok(Self::StreamProxy),
+            "echo" => Ok(Self::Echo),
             other => Err(format!("unknown backend mode '{other}'").into()),
         }
     }
+}
+
+struct BackendState {
+    setting: String,
 }
 
 struct State {
@@ -72,6 +89,7 @@ static CANCELLED_STREAMS: AtomicI64 = AtomicI64::new(0);
 
 #[derive(Default)]
 struct Buffers {
+    host_policy: String,
     ram: Mutex<Vec<RamBuffer>>,
     pinned: Mutex<Vec<PinnedRamBuffer>>,
     gpu: Mutex<Vec<GpuBuffer>>,
@@ -153,6 +171,32 @@ struct MnistBackend;
 impl Backend for MnistBackend {
     fn initialize(backend: &BackendHandle) -> Result<(), Error> {
         println!("Initializing backend: {}", backend.name()?);
+        let config: serde_json::Value = serde_json::from_str(&backend.config()?)?;
+        let setting = config["cmdline"]["stage3-setting"]
+            .as_str()
+            .ok_or("missing custom_backend stage3-setting")?;
+        if setting != "verified" {
+            return Err(format!("unexpected stage3-setting '{setting}'").into());
+        }
+        if !backend.artifacts()?.is_dir() {
+            return Err("backend artifacts directory is missing".into());
+        }
+        drop(backend.memory_manager()?.ram(1)?);
+        backend.set_state(BackendState {
+            setting: setting.to_string(),
+        })?;
+        Ok(())
+    }
+
+    fn attributes(
+        backend: &BackendHandle,
+        attributes: &mut BackendAttributes,
+    ) -> Result<(), Error> {
+        if backend.state::<BackendState>()?.setting != "verified" {
+            return Err("backend state has an unexpected setting".into());
+        }
+        attributes.add_preferred_instance_group(InstanceKind::Cpu, 2, &[])?;
+        attributes.set_parallel_model_instance_loading(true)?;
         Ok(())
     }
 
@@ -174,7 +218,10 @@ impl Backend for MnistBackend {
     }
 
     fn model_instance_initialize(instance: &ModelInstance) -> Result<(), Error> {
-        instance.set_state(Buffers::default())?;
+        instance.set_state(Buffers {
+            host_policy: instance.host_policy()?.name().to_string(),
+            ..Default::default()
+        })?;
         instance.report_memory_usage(&[BufferAttributes::new(
             MemoryType::Cpu,
             0,
@@ -198,8 +245,201 @@ impl Backend for MnistBackend {
                 }
                 Ok(())
             }
+            Mode::Echo => {
+                for request in requests {
+                    execute_echo(&ctx, request).await?;
+                }
+                Ok(())
+            }
         }
     }
+}
+
+async fn execute_echo(ctx: &Context, request: Request) -> Result<(), Error> {
+    match request.parameter("proxy")? {
+        None => execute_echo_direct(ctx, request),
+        Some(Parameter::String(kind)) => execute_echo_proxy(ctx, request, &kind).await,
+        Some(_) => Err("proxy must be a string parameter".into()),
+    }
+}
+
+fn execute_echo_direct(ctx: &Context, request: Request) -> Result<(), Error> {
+    let fp16 = request.get_input("FP16")?;
+    let fp16_shape = fp16.properties()?.shape;
+    let fp16 = fp16.as_fp16_vec()?;
+    let bf16 = request.get_input("BF16")?;
+    let bf16_shape = bf16.properties()?.shape;
+    let bf16 = bf16.as_bf16_vec()?;
+    let fp64 = request.get_input("FP64")?;
+    let fp64_shape = fp64.properties()?.shape;
+    let fp64 = fp64.as_fp64_vec()?;
+    let int8 = request.get_input("INT8")?;
+    let int8_shape = int8.properties()?.shape;
+    let int8 = int8.as_i8_vec()?;
+    let uint8 = request.get_input("UINT8")?;
+    let uint8_shape = uint8.properties()?.shape;
+    let uint8 = uint8.as_u8_vec()?;
+    let uint16 = request.get_input("UINT16")?;
+    let uint16_shape = uint16.properties()?.shape;
+    let uint16 = uint16.as_u16_vec()?;
+    let uint32 = request.get_input("UINT32")?;
+    let uint32_shape = uint32.properties()?.shape;
+    let uint32 = uint32.as_u32_vec()?;
+    let boolean = request.get_input("BOOL")?;
+    let bool_shape = boolean.properties()?.shape;
+    let boolean = boolean.as_bool_vec()?;
+
+    let metadata = request_metadata(ctx, &request)?;
+    let mut response = Response::new(request)?;
+    response
+        .create_output("FP16", DataType::Fp16, &fp16_shape)?
+        .write_fp16_vec(&fp16)?;
+    response
+        .create_output("BF16", DataType::Bf16, &bf16_shape)?
+        .write_bf16_vec(&bf16)?;
+    response
+        .create_output("FP64", DataType::Fp64, &fp64_shape)?
+        .write_fp64_vec(&fp64)?;
+    response
+        .create_output("INT8", DataType::Int8, &int8_shape)?
+        .write_i8_vec(&int8)?;
+    response
+        .create_output("UINT8", DataType::Uint8, &uint8_shape)?
+        .write_u8_vec(&uint8)?;
+    response
+        .create_output("UINT16", DataType::Uint16, &uint16_shape)?
+        .write_u16_vec(&uint16)?;
+    response
+        .create_output("UINT32", DataType::Uint32, &uint32_shape)?
+        .write_u32_vec(&uint32)?;
+    response
+        .create_output("BOOL", DataType::Bool, &bool_shape)?
+        .write_bool_vec(&boolean)?;
+    response
+        .create_output("METADATA", DataType::Bytes, &[1])?
+        .write_string(&metadata)?;
+    response.send()?;
+    Ok(())
+}
+
+fn request_metadata(ctx: &Context, request: &Request) -> Result<String, Error> {
+    let (correlation_id, correlation_id_string) = match request.correlation_id() {
+        Ok(id) => (serde_json::json!(id), serde_json::Value::Null),
+        Err(_) => (
+            serde_json::Value::Null,
+            serde_json::json!(request.correlation_id_string()?),
+        ),
+    };
+    let flags = request.flags()?;
+    let target_model = &ctx.state::<State>()?.target_model;
+    let config: serde_json::Value =
+        serde_json::from_str(&ctx.server().model_config(target_model, -1)?)?;
+    let statistics: serde_json::Value =
+        serde_json::from_str(&ctx.server().model_statistics("", -1)?)?;
+    let index: serde_json::Value = serde_json::from_str(&ctx.server().model_index(true)?)?;
+    let has_statistics = statistics["model_stats"].as_array().is_some_and(|models| {
+        models
+            .iter()
+            .any(|model| model["name"] == target_model.as_str())
+    });
+    let has_index = index.as_array().is_some_and(|models| {
+        models
+            .iter()
+            .any(|model| model["name"] == target_model.as_str())
+    });
+
+    Ok(serde_json::json!({
+        "id": request.id()?,
+        "correlation_id": correlation_id,
+        "correlation_id_string": correlation_id_string,
+        "sequence_start": flags.sequence_start,
+        "sequence_end": flags.sequence_end,
+        "timeout": request.timeout()?,
+        "bool_parameter": parameter_json(request.parameter("bool")?),
+        "int_parameter": parameter_json(request.parameter("int")?),
+        "double_parameter": parameter_json(request.parameter("double")?),
+        "string_parameter": parameter_json(request.parameter("string")?),
+        "host_policy": ctx.instance_state::<Buffers>()?.host_policy,
+        "server_config": config["name"] == target_model.as_str(),
+        "server_statistics": has_statistics,
+        "server_index": has_index,
+    })
+    .to_string())
+}
+
+fn parameter_json(value: Option<Parameter>) -> serde_json::Value {
+    match value {
+        Some(Parameter::Bool(value)) => serde_json::json!(value),
+        Some(Parameter::Int(value)) => serde_json::json!(value),
+        Some(Parameter::Double(value)) => serde_json::json!(value),
+        Some(Parameter::String(value)) => serde_json::json!(value),
+        None => serde_json::Value::Null,
+    }
+}
+
+async fn execute_echo_proxy(
+    ctx: &Context,
+    request: Request,
+    correlation_kind: &str,
+) -> Result<(), Error> {
+    let mut inputs = Vec::new();
+    for &(name, datatype) in &ECHO_INPUTS {
+        let input = request.get_input(name)?;
+        inputs.push((name, datatype, input.properties()?.shape, input.as_bytes()?));
+    }
+
+    let target_model = &ctx.state::<State>()?.target_model;
+    let mut inference = InferenceRequest::new(ctx.server(), target_model, -1)?;
+    let host_policy = &ctx.instance_state::<Buffers>()?.host_policy;
+    for (name, datatype, shape, data) in inputs {
+        inference.add_input(name, datatype, &shape)?;
+        inference.append_input_data(name, &data)?;
+        if name == "FP16" {
+            inference.append_input_data_with_host_policy(name, &data, host_policy)?;
+        }
+    }
+    inference.set_parameter("bool", true)?;
+    inference.set_parameter("int", 99)?;
+    inference.set_parameter("double", 2.5)?;
+    inference.set_parameter("string", "downstream")?;
+    match correlation_kind {
+        "numeric" => inference.set_correlation_id(42)?,
+        "string" => inference.set_correlation_id_string("sequence-alpha")?,
+        other => return Err(format!("unknown proxy correlation kind '{other}'").into()),
+    }
+    inference.set_flags(RequestFlags {
+        sequence_start: true,
+        sequence_end: true,
+    })?;
+    inference.set_timeout(5_000_000)?;
+    inference.set_priority(1)?;
+
+    inference.add_input("REMOVE_ME", DataType::Uint8, &[1])?;
+    inference.append_input_data("REMOVE_ME", &[0])?;
+    inference.remove_input("REMOVE_ME")?;
+    inference.add_requested_output_into("REMOVE_ME", ctx.memory().ram(1)?)?;
+    inference.remove_requested_output("REMOVE_ME")?;
+    for &(name, _) in &ECHO_INPUTS {
+        inference.add_requested_output(name)?;
+    }
+    inference.add_requested_output("METADATA")?;
+
+    let mut stream = ctx.server().infer_stream(inference);
+    let result = stream
+        .next()
+        .await
+        .ok_or("tensor_echo returned no BLS response")??;
+    if !result.is_final {
+        return Err("tensor_echo returned a non-final BLS response".into());
+    }
+    let mut response = Response::new(request)?;
+    for output in result.outputs {
+        response
+            .create_output(&output.name, output.datatype, &output.shape)?
+            .write_bytes(output.bytes()?)?;
+    }
+    response.send()?;
+    Ok(())
 }
 
 async fn execute_mnist(ctx: Context, requests: Vec<Request>) -> Result<(), Error> {

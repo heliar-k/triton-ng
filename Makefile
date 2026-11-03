@@ -44,5 +44,6 @@ download-model:
 	mkdir -p models/identity_gpu/1
 	mkdir -p models/decoupled/1
 	mkdir -p models/stream_proxy/1
+	mkdir -p models/tensor_echo/1
 	wget https://github.com/onnx/models/raw/main/validated/vision/classification/mnist/model/mnist-12.onnx
 	mv mnist-12.onnx models/mnist_onnx/1/model.onnx

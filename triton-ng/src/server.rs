@@ -214,6 +214,79 @@ impl Server {
         metadata.to_json()
     }
 
+    /// Returns a model's normalized configuration as JSON. The server must be
+    /// READY, so call this during request execution rather than a startup
+    /// model-loading hook. Version `-1` selects the model's version policy.
+    /// Fails when the name contains NUL, the model is unavailable, the server
+    /// is not READY, or config version 1 cannot represent the config.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let config = ctx.server().model_config("encoder", -1)?;
+    /// ```
+    pub fn model_config(&self, model_name: &str, version: i64) -> Result<String, TritonError> {
+        let model_name = cstring_from_str(model_name)?;
+        let config = Message::from_ptr(triton_call!(
+            triton_ng_sys::TRITONSERVER_ServerModelConfig(
+                self.ptr,
+                model_name.as_ptr(),
+                version,
+                1,
+                &mut _,
+            )
+        )?);
+        config.to_json()
+    }
+
+    /// Returns model statistics as JSON. An empty model name requests all
+    /// models; version `-1` selects each model's version policy. The server
+    /// must be READY and built with statistics support. Fails when the name
+    /// contains NUL, the model is unavailable, or the server cannot provide
+    /// statistics.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let all_models = ctx.server().model_statistics("", -1)?;
+    /// let one_model = ctx.server().model_statistics("encoder", -1)?;
+    /// ```
+    pub fn model_statistics(&self, model_name: &str, version: i64) -> Result<String, TritonError> {
+        let model_name = cstring_from_str(model_name)?;
+        let statistics = Message::from_ptr(triton_call!(
+            triton_ng_sys::TRITONSERVER_ServerModelStatistics(
+                self.ptr,
+                model_name.as_ptr(),
+                version,
+                &mut _,
+            )
+        )?);
+        statistics.to_json()
+    }
+
+    /// Returns the model repository index as JSON. When `ready_only` is true,
+    /// the index contains only loaded models ready for inference. Fails when
+    /// the server is not READY or rejects the query.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let ready_models = ctx.server().model_index(true)?;
+    /// ```
+    pub fn model_index(&self, ready_only: bool) -> Result<String, TritonError> {
+        let flags = if ready_only {
+            triton_ng_sys::tritonserver_modelindexflag_enum_TRITONSERVER_INDEX_FLAG_READY
+        } else {
+            0
+        };
+        let index = Message::from_ptr(triton_call!(triton_ng_sys::TRITONSERVER_ServerModelIndex(
+            self.ptr,
+            flags,
+            &mut _,
+        ))?);
+        index.to_json()
+    }
+
     /// Submits inference and returns a future that aggregates every response
     /// into one final result. Submission errors are reported by the future.
     /// Dropping the future does not cancel the request.

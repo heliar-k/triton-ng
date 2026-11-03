@@ -2,7 +2,7 @@ use crate::Input;
 use crate::error::{Error, TritonError};
 use crate::model_instance::InstanceHandle;
 use crate::timing::{PendingResponseTimestamps, RequestTimestamps, monotonic_nanos};
-use crate::types::Parameter;
+use crate::types::{Parameter, RequestFlags};
 use crate::utils::{cstr_to_string, cstring_from_str};
 use libc::{c_char, c_void};
 use std::marker::PhantomData;
@@ -139,6 +139,71 @@ impl Request {
     /// ```
     pub fn parameter(&self, key: &str) -> Result<Option<Parameter>, Error> {
         self.view().parameter(key)
+    }
+
+    /// Returns the client-supplied request ID, or an empty string when no ID
+    /// was supplied. Fails when the request was released or Triton rejects
+    /// the read.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let id = request.id()?;
+    /// ```
+    pub fn id(&self) -> Result<String, TritonError> {
+        self.view().id()
+    }
+
+    /// Returns the numeric correlation ID. Zero means no correlation ID.
+    /// Fails when the request has a string correlation ID, was released, or
+    /// Triton rejects the read.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let sequence = request.correlation_id()?;
+    /// ```
+    pub fn correlation_id(&self) -> Result<u64, TritonError> {
+        self.view().correlation_id()
+    }
+
+    /// Returns the string correlation ID. Fails when the request has a numeric
+    /// correlation ID, including the default value of zero. Also fails when
+    /// the request was released or Triton rejects the read.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let sequence = request.correlation_id_string()?;
+    /// ```
+    pub fn correlation_id_string(&self) -> Result<String, TritonError> {
+        self.view().correlation_id_string()
+    }
+
+    /// Returns the sequence-start and sequence-end flags. Fails when the
+    /// request was released or Triton rejects the read.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// if request.flags()?.sequence_start {
+    ///     // Initialize sequence state.
+    /// }
+    /// ```
+    pub fn flags(&self) -> Result<RequestFlags, TritonError> {
+        self.view().flags()
+    }
+
+    /// Returns the request timeout in microseconds. Zero means no timeout.
+    /// Fails when the request was released or Triton rejects the read.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let timeout_us = request.timeout()?;
+    /// ```
+    pub fn timeout(&self) -> Result<u64, TritonError> {
+        self.view().timeout()
     }
 
     /// Returns `true` if the client cancelled the request.
@@ -436,6 +501,91 @@ impl<'a> RequestView<'a> {
         }
 
         Ok(None)
+    }
+
+    /// Returns the client-supplied request ID, or an empty string when no ID
+    /// was supplied. The returned Rust string owns a copy. Fails when the
+    /// request was released or Triton rejects the read.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let id = request.view().id()?;
+    /// ```
+    pub fn id(&self) -> Result<String, TritonError> {
+        let ptr = self.ptr()?;
+        let mut id = ptr::null();
+        triton_call!(triton_ng_sys::TRITONBACKEND_RequestId(ptr, &mut id))?;
+        Ok(unsafe { cstr_to_string(id) })
+    }
+
+    /// Returns the numeric correlation ID. Zero means no correlation ID.
+    /// Fails when the request has a string correlation ID, was released, or
+    /// Triton rejects the read.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let sequence = request.view().correlation_id()?;
+    /// ```
+    pub fn correlation_id(&self) -> Result<u64, TritonError> {
+        let ptr = self.ptr()?;
+        let mut id = 0;
+        triton_call!(triton_ng_sys::TRITONBACKEND_RequestCorrelationId(
+            ptr, &mut id
+        ))?;
+        Ok(id)
+    }
+
+    /// Returns an owned copy of the string correlation ID. Fails when the
+    /// request has a numeric correlation ID, including the default value of
+    /// zero. Also fails when the request was released or Triton rejects the
+    /// read.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let sequence = request.view().correlation_id_string()?;
+    /// ```
+    pub fn correlation_id_string(&self) -> Result<String, TritonError> {
+        let ptr = self.ptr()?;
+        let mut id = ptr::null();
+        triton_call!(triton_ng_sys::TRITONBACKEND_RequestCorrelationIdString(
+            ptr, &mut id
+        ))?;
+        Ok(unsafe { cstr_to_string(id) })
+    }
+
+    /// Returns the sequence-start and sequence-end flags. Fails when the
+    /// request was released or Triton rejects the read.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let flags = request.view().flags()?;
+    /// ```
+    pub fn flags(&self) -> Result<RequestFlags, TritonError> {
+        let ptr = self.ptr()?;
+        let mut flags = 0;
+        triton_call!(triton_ng_sys::TRITONBACKEND_RequestFlags(ptr, &mut flags))?;
+        Ok(RequestFlags::from_sys(flags))
+    }
+
+    /// Returns the request timeout in microseconds. Zero means no timeout.
+    /// Fails when the request was released or Triton rejects the read.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let timeout_us = request.view().timeout()?;
+    /// ```
+    pub fn timeout(&self) -> Result<u64, TritonError> {
+        let ptr = self.ptr()?;
+        let mut timeout = 0;
+        triton_call!(
+            triton_ng_sys::TRITONBACKEND_InferenceRequestTimeoutMicroseconds(ptr, &mut timeout)
+        )?;
+        Ok(timeout)
     }
 
     /// Returns the request trace, or `None` when this request is not sampled

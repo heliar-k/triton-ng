@@ -74,6 +74,50 @@ impl DataType {
     }
 }
 
+/// Sequence flags of an inference request. This is the Rust representation of
+/// Triton's sequence-start and sequence-end bits.
+///
+/// # Examples
+///
+/// ```ignore
+/// inference.set_flags(RequestFlags {
+///     sequence_start: true,
+///     sequence_end: false,
+/// })?;
+/// ```
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RequestFlags {
+    /// Whether this request starts a sequence.
+    pub sequence_start: bool,
+    /// Whether this request ends a sequence.
+    pub sequence_end: bool,
+}
+
+impl RequestFlags {
+    pub(crate) fn from_sys(flags: u32) -> Self {
+        Self {
+            sequence_start: flags
+                & triton_ng_sys::tritonserver_requestflag_enum_TRITONSERVER_REQUEST_FLAG_SEQUENCE_START
+                != 0,
+            sequence_end: flags
+                & triton_ng_sys::tritonserver_requestflag_enum_TRITONSERVER_REQUEST_FLAG_SEQUENCE_END
+                != 0,
+        }
+    }
+
+    pub(crate) fn to_sys(self) -> u32 {
+        let mut flags = 0;
+        if self.sequence_start {
+            flags |= triton_ng_sys::tritonserver_requestflag_enum_TRITONSERVER_REQUEST_FLAG_SEQUENCE_START;
+        }
+        if self.sequence_end {
+            flags |=
+                triton_ng_sys::tritonserver_requestflag_enum_TRITONSERVER_REQUEST_FLAG_SEQUENCE_END;
+        }
+        flags
+    }
+}
+
 /// Location of an allocation reported as model or instance memory usage.
 ///
 /// # Examples
@@ -110,6 +154,16 @@ pub enum InstanceKind {
 }
 
 impl InstanceKind {
+    pub(crate) fn to_sys(self) -> triton_ng_sys::TRITONSERVER_InstanceGroupKind {
+        use triton_ng_sys::*;
+        match self {
+            Self::Auto => TRITONSERVER_instancegroupkind_enum_TRITONSERVER_INSTANCEGROUPKIND_AUTO,
+            Self::Cpu => TRITONSERVER_instancegroupkind_enum_TRITONSERVER_INSTANCEGROUPKIND_CPU,
+            Self::Gpu => TRITONSERVER_instancegroupkind_enum_TRITONSERVER_INSTANCEGROUPKIND_GPU,
+            Self::Model => TRITONSERVER_instancegroupkind_enum_TRITONSERVER_INSTANCEGROUPKIND_MODEL,
+        }
+    }
+
     #[allow(non_upper_case_globals)]
     pub(crate) fn from_sys(v: triton_ng_sys::TRITONSERVER_InstanceGroupKind) -> Self {
         use triton_ng_sys::*;

@@ -114,6 +114,16 @@ impl<'a> Output<'a> {
         self.write_le(DataType::Fp32, data, |v| v.to_le_bytes())
     }
 
+    /// Writes every element of an FP64 tensor.
+    ///
+    /// Fails when the output has another datatype, the element count does not
+    /// match its shape, or Triton cannot provide a host buffer.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// output.write_fp64_vec(&[1.25, -2.5])?;
+    /// ```
     pub fn write_fp64_vec(&mut self, data: &[f64]) -> Result<(), TritonError> {
         self.write_le(DataType::Fp64, data, |v| v.to_le_bytes())
     }
@@ -126,8 +136,104 @@ impl<'a> Output<'a> {
         self.write_le(DataType::Int64, data, |v| v.to_le_bytes())
     }
 
+    /// Writes every element of a BOOL tensor as one zero or one byte.
+    ///
+    /// Fails when the output has another datatype, the element count does not
+    /// match its shape, or Triton cannot provide a host buffer.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// output.write_bool_vec(&[true, false, true])?;
+    /// ```
     pub fn write_bool_vec(&mut self, data: &[bool]) -> Result<(), TritonError> {
         self.write_le(DataType::Bool, data, |v| [u8::from(v)])
+    }
+
+    /// Writes raw IEEE 754 binary16 bit patterns to an FP16 tensor. No
+    /// floating-point conversion is performed.
+    ///
+    /// Fails when the output has another datatype, the element count does not
+    /// match its shape, or Triton cannot provide a host buffer.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// output.write_fp16_vec(&[0x3c00, 0xc000])?; // 1.0 and -2.0
+    /// ```
+    pub fn write_fp16_vec(&mut self, data: &[u16]) -> Result<(), TritonError> {
+        self.write_le(DataType::Fp16, data, |value| value.to_le_bytes())
+    }
+
+    /// Writes raw bfloat16 bit patterns to a BF16 tensor. No floating-point
+    /// conversion is performed.
+    ///
+    /// Fails when the output has another datatype, the element count does not
+    /// match its shape, or Triton cannot provide a host buffer.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// output.write_bf16_vec(&[0x3f80, 0x4000])?; // 1.0 and 2.0
+    /// ```
+    pub fn write_bf16_vec(&mut self, data: &[u16]) -> Result<(), TritonError> {
+        self.write_le(DataType::Bf16, data, |value| value.to_le_bytes())
+    }
+
+    /// Writes every element of an INT8 tensor.
+    ///
+    /// Fails when the output has another datatype, the element count does not
+    /// match its shape, or Triton cannot provide a host buffer.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// output.write_i8_vec(&[-1, 0, 1])?;
+    /// ```
+    pub fn write_i8_vec(&mut self, data: &[i8]) -> Result<(), TritonError> {
+        self.write_le(DataType::Int8, data, |value| value.to_le_bytes())
+    }
+
+    /// Writes every element of a UINT8 tensor.
+    ///
+    /// Fails when the output has another datatype, the element count does not
+    /// match its shape, or Triton cannot provide a host buffer.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// output.write_u8_vec(&[0, 128, 255])?;
+    /// ```
+    pub fn write_u8_vec(&mut self, data: &[u8]) -> Result<(), TritonError> {
+        self.write_le(DataType::Uint8, data, |value| value.to_le_bytes())
+    }
+
+    /// Writes every element of a UINT16 tensor.
+    ///
+    /// Fails when the output has another datatype, the element count does not
+    /// match its shape, or Triton cannot provide a host buffer.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// output.write_u16_vec(&[0, 65535])?;
+    /// ```
+    pub fn write_u16_vec(&mut self, data: &[u16]) -> Result<(), TritonError> {
+        self.write_le(DataType::Uint16, data, |value| value.to_le_bytes())
+    }
+
+    /// Writes every element of a UINT32 tensor.
+    ///
+    /// Fails when the output has another datatype, the element count does not
+    /// match its shape, or Triton cannot provide a host buffer.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// output.write_u32_vec(&[0, 4_000_000_000])?;
+    /// ```
+    pub fn write_u32_vec(&mut self, data: &[u32]) -> Result<(), TritonError> {
+        self.write_le(DataType::Uint32, data, |value| value.to_le_bytes())
     }
 
     pub fn write_u64(&mut self, value: u64) -> Result<(), TritonError> {

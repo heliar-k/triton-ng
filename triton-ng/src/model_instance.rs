@@ -1,6 +1,7 @@
 use crate::buffer_attributes::BufferAttributes;
 use crate::error::{Error, TritonError};
 use crate::executor::InstanceExecutor;
+use crate::message::Message;
 use crate::model::Model;
 use crate::types::InstanceKind;
 use crate::utils::cstr_to_string;
@@ -10,6 +11,47 @@ use std::ffi::c_void;
 use std::ptr;
 use std::sync::Arc;
 use triton_ng_macros::triton_call;
+
+/// Host policy of a model instance. Owns the policy name and the serialized
+/// JSON settings returned by Triton.
+///
+/// # Examples
+///
+/// ```ignore
+/// let policy = instance.host_policy()?;
+/// println!("{}: {}", policy.name(), policy.config_json());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostPolicy {
+    name: String,
+    config_json: String,
+}
+
+impl HostPolicy {
+    /// Returns the policy name accepted by host-policy-specific input APIs.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let name = instance.host_policy()?.name();
+    /// ```
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the complete JSON object, whose only top-level key is the
+    /// policy name and whose value contains the policy settings.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let settings: serde_json::Value =
+    ///     serde_json::from_str(instance.host_policy()?.config_json())?;
+    /// ```
+    pub fn config_json(&self) -> &str {
+        &self.config_json
+    }
+}
 
 /// A model instance: Triton runs one per `instance_group` entry and device.
 ///
@@ -83,6 +125,38 @@ impl ModelInstance {
             self.ptr, &mut kind
         ))?;
         Ok(InstanceKind::from_sys(kind))
+    }
+
+    /// Reads this instance's host policy. Triton supplies a default policy
+    /// named `cpu`, `gpu_<device_id>` or `model` when the instance group does
+    /// not name one. Fails when Triton rejects the query or returns malformed
+    /// JSON.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let policy = instance.host_policy()?;
+    /// log::info(&format!("host policy: {}", policy.name()));
+    /// ```
+    pub fn host_policy(&self) -> Result<HostPolicy, Error> {
+        let ptr = triton_call!(triton_ng_sys::TRITONBACKEND_ModelInstanceHostPolicy(
+            self.ptr,
+            &mut _
+        ))?;
+        let config_json = Message::borrowed_json(ptr)?;
+        let value: serde_json::Value = serde_json::from_str(&config_json)?;
+        let object = value
+            .as_object()
+            .ok_or("model instance host policy is not a JSON object")?;
+        if object.len() != 1 {
+            return Err("model instance host policy must have exactly one name".into());
+        }
+        let name = object
+            .keys()
+            .next()
+            .cloned()
+            .ok_or("model instance host policy has no name")?;
+        Ok(HostPolicy { name, config_json })
     }
 
     /// The model this instance belongs to.

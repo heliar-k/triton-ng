@@ -61,6 +61,7 @@ make build
 echo "== 校验导出符号 =="
 expected="$(printf '%s\n' \
   TRITONBACKEND_Finalize \
+  TRITONBACKEND_GetBackendAttribute \
   TRITONBACKEND_Initialize \
   TRITONBACKEND_ModelFinalize \
   TRITONBACKEND_ModelInitialize \
@@ -72,7 +73,7 @@ actual="$(nm -D --defined-only "${SO}" | awk '{print $3}' | grep '^TRITONBACKEND
 
 echo "== 组装模型仓库 =="
 [[ -f models/mnist_onnx/1/model.onnx ]] || make download-model
-for model in mnist mnist_onnx identity_gpu decoupled stream_proxy; do
+for model in mnist mnist_onnx identity_gpu decoupled stream_proxy tensor_echo; do
   mkdir -p "${MODELS}/${model}/1"
   cp "verify/models/${model}/config.pbtxt" "${MODELS}/${model}/config.pbtxt"
 done
@@ -114,6 +115,7 @@ docker run -d --name "${CONTAINER}" \
   "${IMAGE}" tritonserver \
   --model-repository=/models \
   --model-control-mode=explicit \
+  --backend-config=custom_backend,stage3-setting=verified \
   --log-verbose=1 \
   ${shm_flag[@]+"${shm_flag[@]}"} \
   --load-model=mnist \
@@ -121,6 +123,7 @@ docker run -d --name "${CONTAINER}" \
   --load-model=identity_gpu \
   --load-model=decoupled \
   --load-model=stream_proxy \
+  --load-model=tensor_echo \
   --trace-config triton,file=/traces/trace.json \
   --trace-config triton,log-frequency=1 \
   --trace-config rate=1 \
