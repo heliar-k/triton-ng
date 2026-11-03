@@ -4,6 +4,8 @@ pub(crate) mod allocation;
 pub mod backend;
 #[path = "backend_handle.rs"]
 pub mod backend_handle;
+#[path = "buffer_attributes.rs"]
+pub mod buffer_attributes;
 #[path = "buffers.rs"]
 pub mod buffers;
 #[path = "error.rs"]
@@ -46,6 +48,8 @@ pub mod response;
 pub(crate) mod response_allocator;
 #[path = "server.rs"]
 pub mod server;
+#[path = "statistics.rs"]
+pub(crate) mod statistics;
 #[path = "timing.rs"]
 pub(crate) mod timing;
 #[path = "types.rs"]
@@ -55,6 +59,7 @@ pub(crate) mod utils;
 
 pub use backend::*;
 pub use backend_handle::*;
+pub use buffer_attributes::*;
 pub use buffers::*;
 pub use error::*;
 pub use executor::Context;
@@ -63,7 +68,9 @@ pub use inference_request::*;
 pub use inference_result::*;
 pub use input::*;
 pub use input_buffer::*;
-pub use memory_manager::*;
+pub use memory_manager::MemoryManager;
+#[allow(unused_imports)]
+pub(crate) use memory_manager::{CPU, CPU_PINNED, GPU};
 pub use model::*;
 pub use model_instance::*;
 pub use output::*;
@@ -197,17 +204,12 @@ pub mod __macro_support {
             };
         let instance = unsafe { model_instance(instance) };
 
+        for request in &mut requests {
+            request.set_instance(instance.handle());
+        }
         let prepared = catch(|| {
             let executor = instance.executor()?;
-            let ctx = crate::executor::context(
-                &model,
-                executor,
-                instance.handle(),
-                instance.device_id()?,
-            )?;
-            for request in &mut requests {
-                request.set_instance(ctx.instance().clone());
-            }
+            let ctx = crate::executor::context(&model, executor, instance.device_id()?)?;
             Ok((executor, ctx))
         });
 
@@ -478,6 +480,8 @@ mod tests {
             Model,
             ModelInstance,
             BackendHandle,
+            BufferAttributes,
+            RequestTrace<'static>,
             RequestView<'static>,
             Input<'static>,
             Output<'static>,

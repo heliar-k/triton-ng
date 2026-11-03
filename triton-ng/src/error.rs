@@ -89,6 +89,12 @@ impl TritonError {
     pub(crate) fn as_ptr(&self) -> *mut triton_ng_sys::TRITONSERVER_Error {
         self.ptr
     }
+
+    pub(crate) fn is_unsupported(&self) -> bool {
+        !self.ptr.is_null()
+            && unsafe { triton_ng_sys::TRITONSERVER_ErrorCode(self.ptr) }
+                == triton_ng_sys::TRITONSERVER_errorcode_enum_TRITONSERVER_ERROR_UNSUPPORTED
+    }
 }
 
 impl std::fmt::Display for TritonError {

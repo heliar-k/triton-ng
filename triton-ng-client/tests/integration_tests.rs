@@ -281,7 +281,20 @@ async fn custom_backend_answers_cancelled_request_as_cancelled() -> Result<()> {
     wait_for_backend_counters(&sut, &config, |held, cancelled| {
         held == 0 && cancelled == cancelled_before + 1
     })
-    .await
+    .await?;
+
+    let stats = sut
+        .model_statistics_for(&config.backend_model)
+        .await?
+        .into_proto();
+    let cancelled = stats
+        .response_stats
+        .get("0")
+        .context("cancelled response statistics not found")?
+        .cancel
+        .context("cancelled response count missing")?;
+    assert!(cancelled.count > 0);
+    Ok(())
 }
 
 async fn hold_request_until_cancelled() -> Result<()> {
@@ -461,6 +474,26 @@ async fn custom_backend_model_unloads_only_after_its_held_request_is_answered() 
     unloading?;
     unloaded?;
     assert!(sut.model_ready(&config.backend_model, None).await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn custom_backend_reports_direct_final_response_statistics() -> Result<()> {
+    let config = Config::load()?;
+    let sut = Sut::new(&config.triton_url).await?;
+    infer_digit(&sut, &config).await?;
+
+    let stats = sut
+        .model_statistics_for(&config.backend_model)
+        .await?
+        .into_proto();
+    let success = stats
+        .response_stats
+        .get("0")
+        .context("direct response statistics not found")?
+        .success
+        .context("direct response success count missing")?;
+    assert!(success.count > 0);
     Ok(())
 }
 

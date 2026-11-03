@@ -1,3 +1,4 @@
+use crate::buffer_attributes::BufferAttributes;
 use crate::error::{Error, TritonError};
 use crate::message::Message;
 use crate::server::Server;
@@ -43,6 +44,36 @@ impl Model {
 
     pub(crate) fn as_ptr(&self) -> *mut triton_ng_sys::TRITONBACKEND_Model {
         self.ptr
+    }
+
+    /// Reports the model's current memory usage, excluding its instances.
+    /// Each entry contains the total for one memory type and device. This
+    /// replaces the previous model-level report; an empty slice clears it.
+    /// The attributes remain owned by the caller and can be dropped on return.
+    ///
+    /// # Errors
+    ///
+    /// Fails when there are more than `u32::MAX` entries or Triton rejects the
+    /// report.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let usage = [BufferAttributes::new(MemoryType::Cpu, 0, 4096)?];
+    /// model.report_memory_usage(&usage)?;
+    /// ```
+    pub fn report_memory_usage(&self, usage: &[BufferAttributes]) -> Result<(), TritonError> {
+        let usage_size = u32::try_from(usage.len())
+            .map_err(|_| TritonError::from_message("too many memory usage entries"))?;
+        let mut pointers: Vec<_> = usage.iter().map(|attributes| attributes.ptr).collect();
+        let pointers = if pointers.is_empty() {
+            ptr::null_mut()
+        } else {
+            pointers.as_mut_ptr()
+        };
+        triton_call!(triton_ng_sys::TRITONBACKEND_ModelReportMemoryUsage(
+            self.ptr, pointers, usage_size,
+        ))
     }
 
     /// Stores backend-defined state for this model.

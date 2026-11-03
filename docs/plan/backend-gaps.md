@@ -112,28 +112,28 @@ C 实现的 `TRITONBACKEND_ResponseFactoryDelete` 只释放工厂自身的 `shar
 - `infer_stream` 在提交前拒绝带预分配输出缓冲的请求：同一块缓冲会被多条响应重复写入，提交时失败比收到第二块时报错更早暴露问题。
 - `InferenceStream` 被丢弃时调用 `TRITONSERVER_InferenceRequestCancel`（提交之后调用才有效），让 Triton 停止产生响应；后续回调发现 channel 已关闭就丢弃结果。
 
-**决定 4：`Context` 里放一个可跨 `.await` 的实例句柄。**
-统计上报与 trace 都需要 `TRITONBACKEND_ModelInstance*`，而 `ModelInstance` 既不是 `Send` 也不是 `Sync`、只在钩子里有效。新的句柄类型是 `Send + Sync + Clone`，有效性论证与 `Server` 相同：`model_instance_finalize` 之前 triton-ng 会等所有批处理结束，因此批处理任务持有期间实例指针有效。
+**决定 4：`Request` 里放一个可跨 `.await` 的实例句柄。**
+统计上报需要 `TRITONBACKEND_ModelInstance*`，而 `ModelInstance` 既不是 `Send` 也不是 `Sync`、只在钩子里有效。新的句柄类型是 `Send + Sync + Clone`，有效性论证与 `Server` 相同：`model_instance_finalize` 之前 triton-ng 会等所有批处理结束，因此批处理任务持有期间实例指针有效。
 
 **决定 5：请求与响应记录时间戳。**
 请求级：收到批处理时记 `exec_start`，批处理的 future 真正开始执行时记 `compute_start`，最后一条响应的 `compute_output_start` 与 `response_end` 分别作为请求级的 `compute_end` 与 `exec_end`。响应级：每次开始构造一条响应时记 `response_start`，输出缓冲写完时记 `compute_output_start`，发送时记 `response_end`。这些值是阶段 2 的输入，用同一个时钟源的纳秒数值，跨请求只做差值。
 
 ### 阶段 2：指标、trace、内存用量
 
-时间戳用单调时钟的纳秒值（等价于 `std::chrono::steady_clock::now().time_since_epoch()`），同一个请求或响应的一组时间戳同源。
+时间戳用单调时钟起点的绝对纳秒值（等价于 `std::chrono::steady_clock::now().time_since_epoch()`），Rust 侧读取 `CLOCK_MONOTONIC`。Triton 会用自己的 `queue_start` 减去后端上报的时间戳，因此不能使用进程启动后的相对值。同一个请求或响应的一组时间戳同源且保持递增。
 
-- 请求级：`TRITONBACKEND_ModelInstanceReportStatistics`，要求请求尚未释放，因此挂在请求结束路径与 `factory.release_request()` 上，上报 `exec_start` / `compute_start` / `compute_end` / `exec_end` 四个时间戳。`success` 的判据是最后一条响应没有带 error；请求在没有任何响应的情况下被提前释放时按失败上报。提前释放的请求在释放那一刻上报。
-- 响应级：每条响应各上报一组，走 `TRITONBACKEND_ModelInstanceResponseStatistics*` 这一组：`New` 建对象，`SetModelInstance` 与 `SetResponseFactory` 两项都要设（上报时同时读这两项），再设 `SetResponseStart`、`SetComputeOutputStart`、`SetResponseEnd`，失败时 `SetError`，然后 `TRITONBACKEND_ModelInstanceReportResponseStatistics` 上报，最后 `Delete`。`SetError` 必须传入与 `TRITONBACKEND_ResponseSend` 同一个 error 对象，所以错误响应的构造与上报写在同一处。
-- 内存用量：先封装 `TRITONSERVER_BufferAttributesNew` / `SetMemoryType` / `SetMemoryTypeId` / `SetByteSize` / `Delete`，再暴露 `TRITONBACKEND_ModelInstanceReportMemoryUsage` 与 `TRITONBACKEND_ModelReportMemoryUsage`，调用点由后端自己在 `model_instance_finalize` 与 `model_finalize` 之前决定。
-- trace：`TRITONBACKEND_RequestTrace` 给出 trace 的借用视图，用 `TRITONSERVER_InferenceTraceReportActivity` 写事件。Triton 没有开启 trace 时该调用返回空指针，Rust 侧给出 `None`。
-- 请求级与响应级指标默认上报，与官方后端一致；trace 只读不建。
+- 请求级：`TRITONBACKEND_ModelInstanceReportStatistics`，要求请求尚未释放，因此挂在请求结束路径与 `factory.release_request()` 上，上报 `exec_start` / `compute_start` / `compute_end` / `exec_end` 四个时间戳。`success` 的判据是最后一条响应没有带 error；请求在没有任何响应的情况下被提前释放时按失败上报。提前释放的请求在释放那一刻上报。成功与失败路径都传真实时间戳，失败路径的 trace 也会读取这些值。
+- 响应级：每条响应各上报一组，走 `TRITONBACKEND_ModelInstanceResponseStatistics*` 这一组：`New` 建对象，`SetModelInstance` 与 `SetResponseFactory` 两项都要设（上报时同时读这两项），再设 `SetResponseStart`、`SetResponseEnd`；有输出时设 `SetComputeOutputStart`，空响应保持 0；失败时 `SetError`，然后 `TRITONBACKEND_ModelInstanceReportResponseStatistics` 上报，最后 `Delete`。`SetError` 必须传入与 `TRITONBACKEND_ResponseSend` 同一个 error 对象，所以错误响应的构造与上报写在同一处。`Response::new` 在上报时临时创建并随后删除一个 response factory；流式响应复用现有工厂。服务器编译时关闭统计后，`New` 成功但不写指针，Rust 侧跳过该次响应级上报。
+- 内存用量：先封装 `TRITONSERVER_BufferAttributesNew` / `SetMemoryType` / `SetMemoryTypeId` / `SetByteSize` / `Delete`，再暴露 `TRITONBACKEND_ModelInstanceReportMemoryUsage` 与 `TRITONBACKEND_ModelReportMemoryUsage`。每个 attributes 必须显式设置 byte size；一次调用传入各类内存与设备当前总量的完整列表，重复调用替换上一份列表，空列表清零。attributes 仍由后端拥有，上报返回后即可删除。调用点由后端自己在 `model_instance_finalize` 与 `model_finalize` 之前决定。
+- trace：`TRITONBACKEND_RequestTrace` 给出 trace 的借用视图，用 `TRITONSERVER_InferenceTraceReportActivity` 写 CUSTOM_ACTIVITY 事件。请求未被采样时返回空指针；服务器编译时关闭 tracing 时返回 UNSUPPORTED，这两种情况在 Rust 侧都给出 `None`。视图借用请求，请求释放后不能继续使用。
+- 请求级与响应级指标默认上报，与官方后端一致；trace 只读不建。响应级统计与内存用量只出现在 model statistics JSON，Prometheus 只包含请求级的 `nv_inference_*`。
 
 ### 阶段 3：加载属性、请求元数据、BLS 请求构造、类型读写
 
 - `BackendHandle` 增加 `config()`（`TRITONBACKEND_BackendConfig`）、`artifacts()`（`TRITONBACKEND_BackendArtifacts`）、`memory_manager()`（`TRITONBACKEND_BackendMemoryManager`）、`set_state` / `state`（`TRITONBACKEND_BackendSetState` / `TRITONBACKEND_BackendState`）。
 - 后端属性走一个由后端导出的回调：`TRITONBACKEND_GetBackendAttribute` 在头文件里标 `TRITONBACKEND_ISPEC`，Triton 用 `dlsym` 查找，可选，并且在 `Initialize` 与 `Finalize` 之间可能被调用多次。`Backend` trait 增加可选方法 `fn attributes(backend: &BackendHandle, attributes: &mut BackendAttributes) -> Result<(), Error>`，由宏导出对应符号。回调可能重复触发，实现必须幂等：每次调用都重新声明同一组属性，不依赖上一次调用的状态。`BackendAttributes` 提供 `add_preferred_instance_group(kind, count, device_ids)` 与 `set_parallel_model_instance_loading(bool)`。
 - `ModelInstance` 增加 `host_policy()`（`TRITONBACKEND_ModelInstanceHostPolicy`）。
-- `RequestView` 增加 `id`、`correlation_id`、`correlation_id_string`、`flags`、`timeout`、`trace` 的读取。`flags` 给出 `SEQUENCE_START` 与 `SEQUENCE_END` 两个布尔值，不直接暴露 C 位掩码。
+- `RequestView` 增加 `id`、`correlation_id`、`correlation_id_string`、`flags`、`timeout` 的读取。`flags` 给出 `SEQUENCE_START` 与 `SEQUENCE_END` 两个布尔值，不直接暴露 C 位掩码。
 - `InferenceRequest` 增加 `set_parameter`（布尔、整数、浮点、字符串四种）、`set_correlation_id`、`set_correlation_id_string`、`set_flags`、`set_timeout`、`set_priority`、`remove_input`、`remove_requested_output`、`append_input_data_with_host_policy`。
   `remove_input` 与 `remove_requested_output` 必须同步清理请求里的 `buffers` 与 `outputs` 记账，否则释放后仍持有已被 Triton 遗忘的缓冲。
 - `Server` 增加后端侧会用到的读接口：`model_config`（`TRITONSERVER_ServerModelConfig`）、`model_statistics`（`TRITONSERVER_ServerModelStatistics`）、`model_index`（`TRITONSERVER_ServerModelIndex`）。
@@ -196,7 +196,7 @@ trait 的形状：一个 `Batching` trait，两个关联状态——`Batcher: De
 - 每个阶段的验收：`make lint` 与 `make tests` 无告警无失败，加上该阶段自己的可观察现象：
   - 阶段 0：对一个 API 版本不兼容的服务器，后端加载失败且错误信息里带双方版本；
   - 阶段 1：流式模型的多块响应、取消正在进行的流、未调用 `finish` 时由 Drop 补一条错误响应、提前释放请求之后仍能继续发送剩余响应；
-  - 阶段 2：指标端点出现该模型的 `nv_inference_*` 与响应级计数，trace 输出里出现后端记录的事件；
+  - 阶段 2：Prometheus 指标端点出现该模型的 `nv_inference_*`，model statistics JSON 出现响应级计数与内存用量，trace 输出里出现后端记录的事件；
   - 阶段 3：模型配置省略 `instance_group` 时按首选值建实例，`--backend-config` 的内容能被读到，`attributes` 回调重复触发时结果一致；
   - 阶段 4：大张量输入的拷贝次数下降，GPU 输出不经过主机内存；
   - 阶段 5：序列模型的状态在连续请求之间延续；

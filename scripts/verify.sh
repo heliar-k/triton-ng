@@ -77,6 +77,7 @@ for model in mnist mnist_onnx identity_gpu decoupled stream_proxy; do
   cp "verify/models/${model}/config.pbtxt" "${MODELS}/${model}/config.pbtxt"
 done
 cp models/mnist_onnx/1/model.onnx "${MODELS}/mnist_onnx/1/model.onnx"
+mkdir -p "${ROOT}/target/traces"
 
 echo "== 启动 Triton ${IMAGE_TAG} =="
 docker image inspect "${IMAGE}" >/dev/null 2>&1 || docker pull "${IMAGE}"
@@ -109,6 +110,7 @@ docker run -d --name "${CONTAINER}" \
   -p 8000:8000 -p 8001:8001 -p 8002:8002 \
   -v "${MODELS}:/models" \
   -v "${SO}:/opt/tritonserver/backends/custom_backend/libtriton_custom_backend.so" \
+  -v "${ROOT}/target/traces:/traces" \
   "${IMAGE}" tritonserver \
   --model-repository=/models \
   --model-control-mode=explicit \
@@ -118,7 +120,11 @@ docker run -d --name "${CONTAINER}" \
   --load-model=mnist_onnx \
   --load-model=identity_gpu \
   --load-model=decoupled \
-  --load-model=stream_proxy >/dev/null
+  --load-model=stream_proxy \
+  --trace-config triton,file=/traces/trace.json \
+  --trace-config triton,log-frequency=1 \
+  --trace-config rate=1 \
+  --trace-config level=TIMESTAMPS >/dev/null
 
 echo "== 等待服务器就绪 =="
 for _ in $(seq 1 60); do

@@ -180,7 +180,7 @@ impl ResponseFactory {
         self.state
             .can_release()
             .map_err(TritonError::from_message)?;
-        self.request.release()?;
+        self.request.release(false)?;
         self.state
             .mark_released()
             .map_err(TritonError::from_message)?;
@@ -233,7 +233,7 @@ impl ResponseFactory {
 
     fn release_after_final(&mut self) -> Result<(), TritonError> {
         if !self.state.released {
-            self.request.release()?;
+            self.request.release(true)?;
             self.state.released = true;
         }
         Ok(())
@@ -253,13 +253,14 @@ impl ResponseFactory {
             self.ptr
         ))?;
         let timing = timing.finish(monotonic_nanos());
+        crate::statistics::report_response(&self.request, self.ptr, timing, Some(&error))?;
         triton_call!(triton_ng_sys::TRITONBACKEND_ResponseSend(
             response,
             0,
             error.as_ptr()
         ))?;
         self.state.mark_response_sent();
-        self.request.timestamps.record_response(timing);
+        self.request.timestamps.record_response(timing, false);
         Ok(())
     }
 }
@@ -311,15 +312,27 @@ impl ResponseOwner<'_> {
         }
     }
 
+    fn report_response(
+        &self,
+        timing: ResponseTimestamps,
+        error: Option<&TritonError>,
+    ) -> Result<(), TritonError> {
+        let factory = match self {
+            Self::Owned(_) => ptr::null_mut(),
+            Self::Factory(factory) => factory.ptr,
+        };
+        crate::statistics::report_response(self.request(), factory, timing, error)
+    }
+
     fn record_response(&mut self, timing: ResponseTimestamps) {
         match self {
             Self::Owned(request) => {
                 request.mark_responded();
-                request.timestamps.record_response(timing);
+                request.timestamps.record_response(timing, true);
             }
             Self::Factory(factory) => {
                 factory.state.mark_response_sent();
-                factory.request.timestamps.record_response(timing);
+                factory.request.timestamps.record_response(timing, true);
             }
         }
     }
@@ -485,6 +498,7 @@ impl Response<'_> {
 
         let response = std::mem::replace(&mut self.ptr, ptr::null_mut());
         let timing = self.timing.finish(monotonic_nanos());
+        self.owner.report_response(timing, None)?;
         let flags = self.owner.send_flags();
         triton_call!(triton_ng_sys::TRITONBACKEND_ResponseSend(
             response,

@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use triton_ng::backend::Backend;
 use triton_ng::{
-    BackendHandle, Context, DataType, Error, GpuBuffer, InferenceFuture, InferenceRequest,
-    MemoryManager, Model, ModelInstance, Parameter, PinnedRamBuffer, RamBuffer, Request, Response,
-    ResponseFactory, UninitGpuBuffer,
+    BackendHandle, BufferAttributes, Context, DataType, Error, GpuBuffer, InferenceFuture,
+    InferenceRequest, MemoryManager, MemoryType, Model, ModelInstance, Parameter, PinnedRamBuffer,
+    RamBuffer, Request, Response, ResponseFactory, UninitGpuBuffer,
 };
 
 const IMAGE: &str = "Input3";
@@ -165,11 +165,22 @@ impl Backend for MnistBackend {
             held: AtomicI64::new(0),
             cancelled: AtomicI64::new(0),
         })?;
+        model.report_memory_usage(&[BufferAttributes::new(
+            MemoryType::Cpu,
+            0,
+            std::mem::size_of::<State>() as u64,
+        )?])?;
         Ok(())
     }
 
     fn model_instance_initialize(instance: &ModelInstance) -> Result<(), Error> {
-        instance.set_state(Buffers::default())
+        instance.set_state(Buffers::default())?;
+        instance.report_memory_usage(&[BufferAttributes::new(
+            MemoryType::Cpu,
+            0,
+            std::mem::size_of::<Buffers>() as u64,
+        )?])?;
+        Ok(())
     }
 
     async fn model_instance_execute(ctx: Context, requests: Vec<Request>) -> Result<(), Error> {
@@ -198,6 +209,9 @@ async fn execute_mnist(ctx: Context, requests: Vec<Request>) -> Result<(), Error
     let mut pending = Vec::new();
 
     for request in requests {
+        if let Some(trace) = request.view().trace()? {
+            trace.report_activity("triton_ng.mnist.start")?;
+        }
         if request.parameter("hold_until_cancelled")? == Some(Parameter::Bool(true)) {
             held.push(request);
             continue;

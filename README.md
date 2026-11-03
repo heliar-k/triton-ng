@@ -86,6 +86,32 @@ while let Some(result) = stream.next().await {
 Dropping an `InferenceStream` before it ends cancels its BLS request on a
 best-effort basis. Dropping an `InferenceFuture` does not cancel it.
 
+### Statistics, traces and memory usage
+
+Request and response statistics are reported automatically. Prometheus exposes
+the request-level `nv_inference_*` families; model statistics JSON contains the
+per-response counts and reported memory usage.
+
+A sampled request provides a borrowed trace for custom activities:
+
+```rust
+if let Some(trace) = request.view().trace()? {
+    trace.report_activity("decode.start")?;
+}
+```
+
+`trace()` returns `None` when the request is not sampled or the server was built
+without tracing support. Report current model or instance memory totals during
+their lifecycles:
+
+```rust
+let usage = [BufferAttributes::new(MemoryType::Gpu, 0, 64 << 20)?];
+instance.report_memory_usage(&usage)?;
+```
+
+Each memory report replaces the previous report at that level. Pass the full
+list of memory types and devices; an empty list clears it.
+
 Build as a `cdylib`:
 
 ```toml

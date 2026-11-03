@@ -40,6 +40,7 @@ pub struct Request {
     ptr: *mut triton_ng_sys::TRITONBACKEND_Request,
     responded: bool,
     managed_by_factory: bool,
+    statistics_reported: bool,
     pub(crate) instance: Option<InstanceHandle>,
     pub(crate) timestamps: RequestTimestamps,
 }
@@ -56,6 +57,7 @@ impl Request {
             ptr,
             responded: false,
             managed_by_factory: false,
+            statistics_reported: false,
             instance: None,
             timestamps: RequestTimestamps::new(),
         }
@@ -190,6 +192,7 @@ impl Request {
         let timing = PendingResponseTimestamps::new();
         let response = triton_call!(triton_ng_sys::TRITONBACKEND_ResponseNew(&mut _, self.ptr))?;
         let timing = timing.finish(monotonic_nanos());
+        crate::statistics::report_response(self, ptr::null_mut(), timing, Some(&error))?;
 
         // ResponseSend takes ownership of the response whatever it returns.
         triton_call!(triton_ng_sys::TRITONBACKEND_ResponseSend(
@@ -199,19 +202,42 @@ impl Request {
         ))?;
 
         self.responded = true;
-        self.timestamps.record_response(timing);
+        self.timestamps.record_response(timing, false);
         Ok(())
     }
 
-    pub(crate) fn release(&mut self) -> Result<(), TritonError> {
+    pub(crate) fn release(&mut self, empty_success: bool) -> Result<(), TritonError> {
         if self.ptr.is_null() {
             return Ok(());
         }
+        self.report_statistics(empty_success)?;
         triton_call!(triton_ng_sys::TRITONBACKEND_RequestRelease(
             self.ptr,
             triton_ng_sys::tritonserver_requestreleaseflag_enum_TRITONSERVER_REQUEST_RELEASE_ALL,
         ))?;
         self.ptr = ptr::null_mut();
+        Ok(())
+    }
+
+    fn report_statistics(&mut self, empty_success: bool) -> Result<(), TritonError> {
+        if self.statistics_reported {
+            return Ok(());
+        }
+        let Some(instance) = &self.instance else {
+            return Ok(());
+        };
+        let [exec_start, compute_start, compute_end, exec_end] =
+            self.timestamps.statistics(monotonic_nanos());
+        triton_call!(triton_ng_sys::TRITONBACKEND_ModelInstanceReportStatistics(
+            instance.as_ptr(),
+            self.ptr,
+            self.timestamps.success(empty_success),
+            exec_start,
+            compute_start,
+            compute_end,
+            exec_end,
+        ))?;
+        self.statistics_reported = true;
         Ok(())
     }
 }
@@ -229,9 +255,49 @@ impl Drop for Request {
         {
             crate::log::error(&format!("failed to send error response: {e}"));
         }
-        if let Err(e) = self.release() {
+        if let Err(e) = self.release(false) {
             crate::log::error(&format!("failed to release request: {e}"));
         }
+    }
+}
+
+/// Trace borrowed from a [`Request`].
+///
+/// The request owns the trace. This view never deletes it and cannot outlive
+/// the request. Neither `Send` nor `Sync`.
+///
+/// # Examples
+///
+/// ```ignore
+/// if let Some(trace) = request.view().trace()? {
+///     trace.report_activity("tokens.generated")?;
+/// }
+/// ```
+pub struct RequestTrace<'a> {
+    ptr: *mut triton_ng_sys::TRITONSERVER_InferenceTrace,
+    borrow: PhantomData<&'a Request>,
+}
+
+impl RequestTrace<'_> {
+    /// Records a CUSTOM_ACTIVITY with the current monotonic timestamp.
+    /// Activity names may contain any characters except NUL.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `name` contains NUL or Triton rejects the activity.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// trace.report_activity("decode.start")?;
+    /// ```
+    pub fn report_activity(&self, name: &str) -> Result<(), TritonError> {
+        let name = cstring_from_str(name)?;
+        triton_call!(triton_ng_sys::TRITONSERVER_InferenceTraceReportActivity(
+            self.ptr,
+            monotonic_nanos(),
+            name.as_ptr(),
+        ))
     }
 }
 
@@ -370,6 +436,38 @@ impl<'a> RequestView<'a> {
         }
 
         Ok(None)
+    }
+
+    /// Returns the request trace, or `None` when this request is not sampled
+    /// or the server was built without tracing support.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the request was released or Triton returns an error other
+    /// than UNSUPPORTED.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// if let Some(trace) = request.view().trace()? {
+    ///     trace.report_activity("input.ready")?;
+    /// }
+    /// ```
+    pub fn trace(&self) -> Result<Option<RequestTrace<'a>>, TritonError> {
+        let request = self.ptr()?;
+        let mut trace = ptr::null_mut();
+        let error = unsafe { triton_ng_sys::TRITONBACKEND_RequestTrace(request, &mut trace) };
+        if !error.is_null() {
+            let error = unsafe { TritonError::new(error) };
+            if error.is_unsupported() {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        Ok((!trace.is_null()).then_some(RequestTrace {
+            ptr: trace,
+            borrow: PhantomData,
+        }))
     }
 
     /// Returns `true` if the client cancelled the request.

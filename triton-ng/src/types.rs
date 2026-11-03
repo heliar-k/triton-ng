@@ -74,6 +74,32 @@ impl DataType {
     }
 }
 
+/// Location of an allocation reported as model or instance memory usage.
+///
+/// # Examples
+///
+/// ```ignore
+/// let weights = BufferAttributes::new(MemoryType::Gpu, 0, 64 << 20)?;
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryType {
+    Cpu,
+    CpuPinned,
+    Gpu,
+}
+
+impl MemoryType {
+    pub(crate) fn to_sys(self) -> triton_ng_sys::TRITONSERVER_MemoryType {
+        match self {
+            Self::Cpu => triton_ng_sys::TRITONSERVER_memorytype_enum_TRITONSERVER_MEMORY_CPU,
+            Self::CpuPinned => {
+                triton_ng_sys::TRITONSERVER_memorytype_enum_TRITONSERVER_MEMORY_CPU_PINNED
+            }
+            Self::Gpu => triton_ng_sys::TRITONSERVER_memorytype_enum_TRITONSERVER_MEMORY_GPU,
+        }
+    }
+}
+
 /// Model instance group kind — mirrors `TRITONSERVER_InstanceGroupKind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstanceKind {

@@ -50,6 +50,13 @@ error response on Drop. Dropping an unfinished factory whose request is still ow
 error response and FINAL. After an early request release, dropping the factory only deletes the C
 factory, matching `TRITONBACKEND_ResponseFactoryDelete`; call `finish` to end that stream.
 
+Every response is reported to response statistics before it is sent. Request
+statistics are reported immediately before request release; an early
+`ResponseFactory::release_request` therefore fixes the request-level outcome
+and timings at that point. `RequestView::trace` borrows a sampled request's
+trace and records custom activities. Model and instance memory reports contain
+the complete current totals and replace the previous report at their level.
+
 A `Response<'f>` and its factory must stay in the same task. Move the factory into the task first,
 then create the response there:
 
@@ -82,6 +89,8 @@ bounded by what Triton guarantees. Backend code only sees these types, never raw
 |---|---|---|---|---|---|
 | `Request` | owns the request | sends an error response if unmanaged, releases the request | yes | no | one request is used by one thread at a time |
 | `RequestView<'_>` | borrows the request | nothing | no | no | read-only; cannot release or outlive the request |
+| `RequestTrace<'_>` | borrows the request's trace | nothing | no | no | cannot outlive or release the request |
+| `BufferAttributes` | owns the C attributes | deletes them | no | no | one memory type, device and current byte total |
 | `Response<'_>` | owns the response | deletes an unsent response and sends an error response | yes | no | owns the request or borrows a factory |
 | `ResponseFactory` | owns the C factory and request | finishes an owned request's stream, or deletes an early-released factory | yes | no | `response()` takes `&mut self` |
 | `Input<'_>` | borrows from its request | nothing | no | no | cannot outlive the request |
@@ -91,8 +100,8 @@ bounded by what Triton guarantees. Backend code only sees these types, never raw
 | `TritonError` | owns the error object, if any | deletes it | yes | yes | |
 | `RamBuffer`, `PinnedRamBuffer`, `GpuBuffer`, `UninitGpuBuffer` | own memory from the memory manager | free it | yes | yes | must not outlive the server, see [Memory buffers](memory_buffers.md) |
 | `Server`, `MemoryManager` | borrow the server and its memory manager | nothing | yes | yes | `Clone`; valid while any model is loaded |
-| `Context` | borrows the instance through an internal handle | nothing | yes | yes | `Clone`; valid until all instance batches finish |
-| `InstanceHandle` (crate-internal) | borrows the model instance | nothing | yes | yes | `Clone`; used by request statistics and trace |
+| `Context` | borrows the server, memory manager and states | nothing | yes | yes | `Clone`; valid while the model is loaded |
+| `InstanceHandle` (crate-internal) | borrows the model instance | nothing | yes | yes | `Clone`; used by request and response statistics |
 | `Model`, `ModelInstance`, `BackendHandle` | borrow the model, instance, backend | nothing | no | no | used only in the init and finalize hooks |
 
 A unit test in the crate (`thread_safety_of_every_handle_is_as_documented`) checks the public rows:

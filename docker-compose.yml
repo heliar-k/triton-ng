@@ -24,9 +24,14 @@ services:
       --load-model=identity_gpu
       --load-model=decoupled
       --load-model=stream_proxy
+      --trace-config triton,file=/traces/trace.json
+      --trace-config triton,log-frequency=1
+      --trace-config rate=1
+      --trace-config level=TIMESTAMPS
     volumes:
       - ./models:/models
       - ./target/release/libtriton_custom_backend.so:/opt/tritonserver/backends/custom_backend/libtriton_custom_backend.so
+      - ./target/traces:/traces
     ports:
       - "8000:8000" # HTTP
       - "8001:8001" # gRPC

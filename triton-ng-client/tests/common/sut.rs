@@ -107,6 +107,16 @@ impl Sut {
             .collect())
     }
 
+    pub async fn model_statistics_for(&self, model: &str) -> Result<client::ModelStatistics> {
+        self.inner
+            .model_statistics(Some(model), None, None)
+            .await
+            .context("model_statistics failed")?
+            .into_iter()
+            .find(|stats| stats.name() == model)
+            .with_context(|| format!("{model} statistics not found"))
+    }
+
     pub async fn infer(
         &self,
         model: &str,

@@ -1,5 +1,5 @@
-use crate::memory_manager::MemoryManager;
-use crate::{Error, MemoryType, RawBuffer};
+use crate::memory_manager::{MemoryManager, MemoryType};
+use crate::{Error, RawBuffer};
 use std::ffi::c_void;
 use std::ptr;
 
